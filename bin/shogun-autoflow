@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import subprocess
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def ensure_automation_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS automation_marks (
+          key TEXT PRIMARY KEY,
+          marked_at TEXT NOT NULL
+        )
+        """
+        )
+
+
+def has_mark(conn: sqlite3.Connection, key: str) -> bool:
+    ensure_automation_table(conn)
+    row = conn.execute("SELECT key FROM automation_marks WHERE key = ?", (key,)).fetchone()
+    return row is not None
+
+
+def set_mark(conn: sqlite3.Connection, key: str) -> None:
+    ensure_automation_table(conn)
+    conn.execute("INSERT OR REPLACE INTO automation_marks(key, marked_at) VALUES (?, ?)", (key, utc_now()))
+
+
+def notify(mode: str, db: Path, sender: str, recipient: str, content: str, summary: str, task_id: int) -> None:
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        mode,
+        "--db",
+        str(db),
+        "send",
+        "--from",
+        sender,
+        "--to",
+        recipient,
+        "--content",
+        content,
+        "--summary",
+        summary,
+        "--task-id",
+        str(task_id),
+    ]
+    subprocess.run(cmd, check=True)
+
+
+def cycle(args: argparse.Namespace) -> dict[str, object]:
+    changed = {
+        "review_assigned": [],
+        "review_ready_notifications": [],
+        "done_notifications": [],
+    }
+    queued_notifications: list[tuple[str, str, int, str, str]] = []
+    with connect(args.db) as conn:
+        ensure_automation_table(conn)
+        review_rows = conn.execute(
+            """
+            SELECT id, owner, reviewer, subject
+            FROM tasks
+            WHERE status = 'review'
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in review_rows:
+            if row["reviewer"] in (None, ""):
+                conn.execute(
+                    "UPDATE tasks SET reviewer = ?, updated_at = ? WHERE id = ?",
+                    (args.default_reviewer, utc_now(), row["id"]),
+                )
+                changed["review_assigned"].append(int(row["id"]))
+            key = f"notify-review:{row['id']}"
+            if not has_mark(conn, key):
+                queued_notifications.append(
+                    (
+                        key,
+                        args.default_reviewer,
+                        int(row["id"]),
+                        f"Task #{row['id']} is ready for review: {row['subject']}",
+                        f"review requested #{row['id']}",
+                    )
+                )
+                changed["review_ready_notifications"].append(int(row["id"]))
+
+        done_rows = conn.execute(
+            """
+            SELECT id, reporter, subject
+            FROM tasks
+            WHERE status = 'done'
+            ORDER BY id
+            """
+        ).fetchall()
+        for row in done_rows:
+            recipient = row["reporter"] or args.default_report_target
+            if not recipient:
+                continue
+            key = f"notify-done:{row['id']}:{recipient}"
+            if not has_mark(conn, key):
+                queued_notifications.append(
+                    (
+                        key,
+                        recipient,
+                        int(row["id"]),
+                        f"Task #{row['id']} completed: {row['subject']}",
+                        f"done #{row['id']}",
+                    )
+                )
+                changed["done_notifications"].append({"task_id": int(row["id"]), "recipient": recipient})
+    delivered_keys: list[str] = []
+    for key, recipient, task_id, content, summary in queued_notifications:
+        notify(args.mode, args.db, args.sender, recipient, content, summary, task_id)
+        delivered_keys.append(key)
+    if delivered_keys:
+        with connect(args.db) as conn:
+            for key in delivered_keys:
+                set_mark(conn, key)
+    return changed
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Auto-routing flow for review and completion")
+    parser.add_argument("--db", type=Path, default=default_db_path())
+    parser.add_argument("--mode", default="teams", choices=("teams", "mailbox", "hybrid", "sendkeys", "ntfy"))
+    parser.add_argument("--sender", default="autoflow")
+    parser.add_argument("--default-reviewer", default="metsuke")
+    parser.add_argument("--default-report-target", default="karo")
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval-sec", type=int, default=30)
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.loop:
+        while True:
+            result = cycle(args)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=True))
+            time.sleep(args.interval_sec)
+    result = cycle(args)
+    if args.json:
+        print(json.dumps(result, ensure_ascii=True, indent=2))
+    else:
+        print(f"review_assigned={len(result['review_assigned'])}")
+        print(f"review_ready_notifications={len(result['review_ready_notifications'])}")
+        print(f"done_notifications={len(result['done_notifications'])}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

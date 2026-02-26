@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import subprocess
+import time
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+ACTIVE_STATUSES = ("todo", "in_progress", "blocked", "review")
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_ts(value: str) -> datetime:
+    return datetime.fromisoformat(value)
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def stale_tasks(conn: sqlite3.Connection, older_than_minutes: int) -> list[sqlite3.Row]:
+    cutoff = utc_now() - timedelta(minutes=older_than_minutes)
+    rows = conn.execute(
+        """
+        SELECT id, subject, owner, status, updated_at
+        FROM tasks
+        WHERE status IN ('todo', 'in_progress', 'blocked', 'review')
+        ORDER BY updated_at ASC
+        """
+    ).fetchall()
+    stale: list[sqlite3.Row] = []
+    for row in rows:
+        updated = parse_ts(row["updated_at"])
+        if updated <= cutoff:
+            stale.append(row)
+    return stale
+
+
+def stale_members(conn: sqlite3.Connection, older_than_minutes: int) -> list[sqlite3.Row]:
+    cutoff = utc_now() - timedelta(minutes=older_than_minutes)
+    rows = conn.execute(
+        """
+        SELECT name, role, status, updated_at
+        FROM members
+        WHERE status != 'offline'
+        ORDER BY updated_at ASC
+        """
+    ).fetchall()
+    stale: list[sqlite3.Row] = []
+    for row in rows:
+        updated = parse_ts(row["updated_at"])
+        if updated <= cutoff:
+            stale.append(row)
+    return stale
+
+
+def unread_summary(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT recipient, COUNT(*) AS unread
+        FROM messages
+        WHERE read_at IS NULL
+        GROUP BY recipient
+        ORDER BY recipient
+        """
+    ).fetchall()
+
+
+def maybe_nag(args: argparse.Namespace, owner: str, task_id: int, subject: str) -> None:
+    if args.dry_run:
+        return
+    if not owner:
+        return
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        args.mode,
+        "--db",
+        str(args.db),
+        "send",
+        "--from",
+        args.sender,
+        "--to",
+        owner,
+        "--content",
+        f"watchdog reminder: task #{task_id} '{subject}' appears stale.",
+        "--summary",
+        f"stale task #{task_id}",
+        "--task-id",
+        str(task_id),
+    ]
+    subprocess.run(cmd, check=False)
+
+
+def run_once(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        tasks = stale_tasks(conn, args.task_timeout_min)
+        members = stale_members(conn, args.member_timeout_min)
+        unread = unread_summary(conn)
+
+    report = {
+        "checked_at": utc_now().isoformat(),
+        "stale_tasks": [dict(row) for row in tasks],
+        "stale_members": [dict(row) for row in members],
+        "unread": [dict(row) for row in unread],
+    }
+
+    if args.json:
+        print(json.dumps(report, ensure_ascii=True, indent=2))
+    else:
+        print(f"[watchdog] {report['checked_at']}")
+        print(f"stale tasks ({len(tasks)}):")
+        if tasks:
+            for row in tasks:
+                print(
+                    f"  - #{row['id']} owner={row['owner'] or '-'} status={row['status']} "
+                    f"updated_at={row['updated_at']} subject={row['subject']}"
+                )
+        else:
+            print("  (none)")
+        print(f"stale members ({len(members)}):")
+        if members:
+            for row in members:
+                print(
+                    f"  - {row['name']} role={row['role']} status={row['status']} updated_at={row['updated_at']}"
+                )
+        else:
+            print("  (none)")
+        print("unread messages:")
+        if unread:
+            for row in unread:
+                print(f"  - recipient={row['recipient']} unread={row['unread']}")
+        else:
+            print("  (none)")
+
+    for row in tasks:
+        maybe_nag(args, str(row["owner"] or ""), int(row["id"]), str(row["subject"]))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Watchdog for shogun team state")
+    parser.add_argument("--db", type=Path, default=default_db_path())
+    parser.add_argument("--mode", default="teams", choices=("teams", "mailbox", "hybrid", "sendkeys", "ntfy"))
+    parser.add_argument("--sender", default="watchdog")
+    parser.add_argument("--task-timeout-min", type=int, default=15)
+    parser.add_argument("--member-timeout-min", type=int, default=15)
+    parser.add_argument("--loop", action="store_true")
+    parser.add_argument("--interval-sec", type=int, default=60)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.loop:
+        while True:
+            run_once(args)
+            time.sleep(args.interval_sec)
+    return run_once(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

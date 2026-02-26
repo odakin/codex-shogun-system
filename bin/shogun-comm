@@ -1,0 +1,559 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import random
+import sqlite3
+import string
+import subprocess
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+try:
+    import fcntl
+except Exception as exc:  # pragma: no cover
+    print(f"error: failed to import fcntl: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+MODES = ("teams", "sendkeys", "mailbox", "hybrid", "ntfy")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def default_mailbox_root() -> Path:
+    return root_dir() / "state" / "mailboxes"
+
+
+def default_ntfy_spool() -> Path:
+    return root_dir() / "state" / "ntfy"
+
+
+def ensure_dirs(*paths: Path) -> None:
+    for path in paths:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    ensure_dirs(db_path.parent)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def ensure_db_initialized(db_path: Path) -> None:
+    ctl = root_dir() / "bin" / "shogunctl"
+    subprocess.run([str(ctl), "--db", str(db_path), "init"], check=True, stdout=subprocess.DEVNULL)
+
+
+def get_recipients(conn: sqlite3.Connection, sender: str, recipient: str) -> list[str]:
+    if recipient != "*":
+        return [recipient]
+    rows = conn.execute("SELECT name FROM members WHERE name != ? ORDER BY name", (sender,)).fetchall()
+    return [row["name"] for row in rows]
+
+
+def member_target(conn: sqlite3.Connection, name: str) -> str:
+    row = conn.execute(
+        "SELECT session, pane FROM members WHERE name = ?",
+        (name,),
+    ).fetchone()
+    if row is None:
+        raise RuntimeError(f"unknown member: {name}")
+    session = row["session"]
+    pane = row["pane"]
+    if not session or pane is None or pane == "":
+        raise RuntimeError(f"member '{name}' has no tmux session/pane registered")
+    return f"{session}:0.{pane}"
+
+
+def tmux_send_text(target: str, text: str) -> None:
+    # Historical send-keys pattern: send body and Enter as separate operations.
+    subprocess.run(["tmux", "send-keys", "-t", target, text], check=True)
+    subprocess.run(["tmux", "send-keys", "-t", target, "C-m"], check=True)
+
+
+def short_id() -> str:
+    tail = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(8))
+    return f"{int(datetime.now(tz=timezone.utc).timestamp())}-{tail}"
+
+
+def yaml_quote(value: str | None) -> str:
+    if value is None:
+        return "null"
+    return json.dumps(value, ensure_ascii=True)
+
+
+def dump_yaml_envelope(envelope: dict[str, object]) -> str:
+    lines: list[str] = []
+    for key in ("id", "sender", "recipient", "kind", "summary", "task_id", "created_at"):
+        value = envelope.get(key)
+        if isinstance(value, int):
+            lines.append(f"{key}: {value}")
+        elif value is None:
+            lines.append(f"{key}: null")
+        else:
+            lines.append(f"{key}: {yaml_quote(str(value))}")
+    lines.append("content: |-")
+    content = str(envelope.get("content", ""))
+    if content:
+        for line in content.splitlines():
+            lines.append(f"  {line}")
+    return "\n".join(lines) + "\n"
+
+
+def parse_yaml_envelope(path: Path) -> dict[str, object]:
+    data: dict[str, object] = {}
+    lines = path.read_text(encoding="utf-8").splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.startswith("content: |"):
+            i += 1
+            content_lines: list[str] = []
+            while i < len(lines):
+                if lines[i].startswith("  "):
+                    content_lines.append(lines[i][2:])
+                    i += 1
+                else:
+                    break
+            data["content"] = "\n".join(content_lines)
+            continue
+        if ":" not in line:
+            i += 1
+            continue
+        key, raw_value = line.split(":", 1)
+        key = key.strip()
+        raw_value = raw_value.strip()
+        if raw_value == "null":
+            data[key] = None
+        elif raw_value.isdigit():
+            data[key] = int(raw_value)
+        elif raw_value.startswith('"') or raw_value.startswith("'"):
+            try:
+                data[key] = json.loads(raw_value)
+            except json.JSONDecodeError:
+                data[key] = raw_value.strip('"').strip("'")
+        else:
+            data[key] = raw_value
+        i += 1
+    if "content" not in data:
+        data["content"] = ""
+    return data
+
+
+def mailbox_dirs(base: Path, name: str) -> tuple[Path, Path, Path, Path]:
+    root = base / name
+    inbox = root / "inbox"
+    processed = root / "processed"
+    lockfile = root / ".lock"
+    seqfile = root / ".seq"
+    return root, inbox, processed, lockfile, seqfile
+
+
+def mailbox_next_seq(seqfile: Path, lockfile: Path) -> int:
+    ensure_dirs(seqfile.parent)
+    lockfile.touch(exist_ok=True)
+    with lockfile.open("r+", encoding="utf-8") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        if seqfile.exists():
+            content = seqfile.read_text(encoding="utf-8").strip()
+            current = int(content) if content else 0
+        else:
+            current = 0
+        nxt = current + 1
+        seqfile.write_text(str(nxt), encoding="utf-8")
+        fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+        return nxt
+
+
+def mailbox_write(base: Path, recipient: str, envelope: dict[str, object]) -> Path:
+    _, inbox, _, lockfile, seqfile = mailbox_dirs(base, recipient)
+    ensure_dirs(inbox)
+    seq = mailbox_next_seq(seqfile, lockfile)
+    envelope = dict(envelope)
+    envelope["mailbox_seq"] = seq
+    payload = dump_yaml_envelope(envelope)
+    tmp = inbox / f".{seq:09d}.{short_id()}.tmp"
+    final = inbox / f"{seq:09d}.yaml"
+    tmp.write_text(payload, encoding="utf-8")
+    os.replace(tmp, final)
+    return final
+
+
+def mailbox_read(
+    base: Path,
+    name: str,
+    limit: int,
+    since: int | None,
+    mark_read: bool,
+) -> list[dict[str, object]]:
+    _, inbox, processed, _, _ = mailbox_dirs(base, name)
+    ensure_dirs(inbox, processed)
+    files = sorted(inbox.glob("*.yaml"))
+    results: list[dict[str, object]] = []
+    for path in files:
+        seq = int(path.stem)
+        if since is not None and seq <= since:
+            continue
+        envelope = parse_yaml_envelope(path)
+        envelope["mailbox_seq"] = seq
+        envelope["mailbox_file"] = str(path)
+        results.append(envelope)
+        if len(results) >= limit:
+            break
+    if mark_read:
+        for item in results:
+            path = Path(str(item["mailbox_file"]))
+            target = processed / path.name
+            os.replace(path, target)
+    return results
+
+
+def db_log_message(
+    conn: sqlite3.Connection,
+    sender: str,
+    recipient: str,
+    kind: str,
+    content: str,
+    task_id: int | None,
+) -> int:
+    cur = conn.execute(
+        """
+        INSERT INTO messages(sender, recipient, kind, content, task_id, created_at, read_at)
+        VALUES (?, ?, ?, ?, ?, ?, NULL)
+        """,
+        (sender, recipient, kind, content, task_id, utc_now()),
+    )
+    return int(cur.lastrowid)
+
+
+def send_via_teams(args: argparse.Namespace) -> int:
+    ctl = root_dir() / "bin" / "shogunctl"
+    cmd = [str(ctl), "--db", str(args.db), "message", "send", "--from", args.sender, "--content", args.content]
+    if args.task_id is not None:
+        cmd.extend(["--task-id", str(args.task_id)])
+    if args.broadcast:
+        cmd.append("--broadcast")
+    else:
+        cmd.extend(["--to", args.to])
+    subprocess.run(cmd, check=True)
+    return 0
+
+
+def send_via_sendkeys(args: argparse.Namespace) -> int:
+    ensure_db_initialized(args.db)
+    with connect(args.db) as conn:
+        recipients = get_recipients(conn, args.sender, "*" if args.broadcast else args.to)
+        if not recipients:
+            print("warning: no recipients matched", file=sys.stderr)
+            return 0
+        for recipient in recipients:
+            target = member_target(conn, recipient)
+            text = f"[msg from {args.sender}] {args.content}"
+            tmux_send_text(target, text)
+            if not args.no_db_log:
+                kind = "broadcast" if args.broadcast else "direct"
+                db_log_message(conn, args.sender, recipient, kind, args.content, args.task_id)
+    return 0
+
+
+def send_via_mailbox(args: argparse.Namespace, with_nudge: bool) -> int:
+    ensure_db_initialized(args.db)
+    ensure_dirs(args.mailbox_root)
+    with connect(args.db) as conn:
+        recipients = get_recipients(conn, args.sender, "*" if args.broadcast else args.to)
+        if not recipients:
+            print("warning: no recipients matched", file=sys.stderr)
+            return 0
+        for recipient in recipients:
+            envelope = {
+                "id": short_id(),
+                "sender": args.sender,
+                "recipient": recipient,
+                "kind": "broadcast" if args.broadcast else "direct",
+                "summary": args.summary,
+                "task_id": args.task_id,
+                "created_at": utc_now(),
+                "content": args.content,
+            }
+            path = mailbox_write(args.mailbox_root, recipient, envelope)
+            if with_nudge:
+                try:
+                    target = member_target(conn, recipient)
+                    tmux_send_text(target, args.nudge)
+                except (RuntimeError, subprocess.CalledProcessError) as exc:
+                    print(f"warning: nudge skipped for recipient={recipient}: {exc}", file=sys.stderr)
+            if not args.no_db_log:
+                db_log_message(
+                    conn,
+                    args.sender,
+                    recipient,
+                    "broadcast" if args.broadcast else "direct",
+                    args.content,
+                    args.task_id,
+                )
+            print(f"mailbox: wrote {path}")
+    return 0
+
+
+def ntfy_topic(args: argparse.Namespace, recipient: str) -> str:
+    if args.ntfy_topic:
+        return args.ntfy_topic
+    if args.broadcast:
+        return "shogun-broadcast"
+    return f"shogun-{recipient}"
+
+
+def send_via_ntfy(args: argparse.Namespace) -> int:
+    ensure_db_initialized(args.db)
+    ensure_dirs(args.ntfy_spool)
+    with connect(args.db) as conn:
+        recipients = get_recipients(conn, args.sender, "*" if args.broadcast else args.to)
+        if not recipients:
+            print("warning: no recipients matched", file=sys.stderr)
+            return 0
+        for recipient in recipients:
+            topic = ntfy_topic(args, recipient)
+            url = args.ntfy_base.rstrip("/") + "/" + urllib.parse.quote(topic, safe="")
+            payload = args.content.encode("utf-8")
+            req = urllib.request.Request(url, data=payload, method="POST")
+            req.add_header("Title", args.summary or f"msg from {args.sender}")
+            req.add_header("Tags", "shogun")
+            req.add_header("X-Sender", args.sender)
+            req.add_header("X-Recipient", recipient)
+            try:
+                with urllib.request.urlopen(req, timeout=args.ntfy_timeout) as resp:
+                    _ = resp.read()
+                print(f"ntfy: sent topic={topic} recipient={recipient}")
+            except urllib.error.URLError as exc:
+                print(f"warning: ntfy send failed for recipient={recipient}: {exc}", file=sys.stderr)
+            spool_entry = {
+                "created_at": utc_now(),
+                "sender": args.sender,
+                "recipient": recipient,
+                "topic": topic,
+                "content": args.content,
+                "summary": args.summary,
+                "task_id": args.task_id,
+            }
+            spool_file = args.ntfy_spool / f"{recipient}.jsonl"
+            with spool_file.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(spool_entry, ensure_ascii=True) + "\n")
+            if not args.no_db_log:
+                db_log_message(
+                    conn,
+                    args.sender,
+                    recipient,
+                    "broadcast" if args.broadcast else "direct",
+                    args.content,
+                    args.task_id,
+                )
+    return 0
+
+
+def cmd_send(args: argparse.Namespace) -> int:
+    mode = args.mode
+    if not args.broadcast and not args.to:
+        print("error: --to is required unless --broadcast", file=sys.stderr)
+        return 1
+    if mode == "teams":
+        return send_via_teams(args)
+    if mode == "sendkeys":
+        return send_via_sendkeys(args)
+    if mode == "mailbox":
+        return send_via_mailbox(args, with_nudge=False)
+    if mode == "hybrid":
+        return send_via_mailbox(args, with_nudge=True)
+    if mode == "ntfy":
+        return send_via_ntfy(args)
+    print(f"error: unknown mode {mode}", file=sys.stderr)
+    return 1
+
+
+def cmd_read(args: argparse.Namespace) -> int:
+    if args.mode == "teams":
+        ctl = root_dir() / "bin" / "shogunctl"
+        cmd = [str(ctl), "--db", str(args.db), "message", "inbox", "--name", args.name, "--limit", str(args.limit)]
+        if args.unread_only:
+            cmd.append("--unread-only")
+        if args.mark_read:
+            cmd.append("--mark-read")
+        if args.since_id is not None:
+            cmd.extend(["--since-id", str(args.since_id)])
+        if args.json:
+            cmd.append("--json")
+        subprocess.run(cmd, check=True)
+        return 0
+
+    if args.mode in {"mailbox", "hybrid"}:
+        msgs = mailbox_read(args.mailbox_root, args.name, args.limit, args.since_id, args.mark_read)
+        if args.unread_only:
+            # mailbox/inbox contains only unread.
+            pass
+        if args.json:
+            print(json.dumps(msgs, ensure_ascii=True, indent=2))
+        else:
+            if not msgs:
+                print("(none)")
+            for m in msgs:
+                print(
+                    f"{m.get('mailbox_seq'):>6} {m.get('created_at','')} "
+                    f"{m.get('sender','?')} -> {m.get('recipient','?')} :: {m.get('content','')}"
+                )
+        return 0
+
+    if args.mode == "ntfy":
+        spool_file = args.ntfy_spool / f"{args.name}.jsonl"
+        records: list[dict[str, object]] = []
+        if spool_file.exists():
+            with spool_file.open("r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        item = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    records.append(item)
+        if args.since_id is not None:
+            records = records[args.since_id :]
+        records = records[-args.limit :]
+        if args.json:
+            print(json.dumps(records, ensure_ascii=True, indent=2))
+        else:
+            if not records:
+                print("(none)")
+            for idx, item in enumerate(records, start=1):
+                print(
+                    f"{idx:>6} {item.get('created_at','')} "
+                    f"{item.get('sender','?')} -> {item.get('recipient','?')} :: {item.get('content','')}"
+                )
+        return 0
+
+    print("error: sendkeys mode has no durable inbox; use teams/mailbox/hybrid/ntfy", file=sys.stderr)
+    return 1
+
+
+def cmd_nudge(args: argparse.Namespace) -> int:
+    ensure_db_initialized(args.db)
+    with connect(args.db) as conn:
+        recipients = get_recipients(conn, args.sender, "*" if args.broadcast else args.to)
+        if not recipients:
+            print("warning: no recipients matched", file=sys.stderr)
+            return 0
+        for recipient in recipients:
+            target = member_target(conn, recipient)
+            tmux_send_text(target, args.token)
+            print(f"nudge sent: {recipient} ({target})")
+    return 0
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    ensure_db_initialized(args.db)
+    ensure_dirs(args.mailbox_root, args.ntfy_spool)
+    with connect(args.db) as conn:
+        rows = conn.execute("SELECT name FROM members ORDER BY name").fetchall()
+        for row in rows:
+            _, inbox, processed, _, _ = mailbox_dirs(args.mailbox_root, row["name"])
+            ensure_dirs(inbox, processed)
+    print(f"initialized comm layer mode={args.mode}")
+    return 0
+
+
+def cmd_flush(args: argparse.Namespace) -> int:
+    if args.mode not in {"mailbox", "hybrid"}:
+        print("flush is only valid for mailbox/hybrid modes", file=sys.stderr)
+        return 1
+    name_dir = args.mailbox_root / args.name / "inbox"
+    if not name_dir.exists():
+        print("0")
+        return 0
+    count = 0
+    for path in sorted(name_dir.glob("*.yaml")):
+        path.unlink()
+        count += 1
+    print(count)
+    return 0
+
+
+def parse_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Shogun communication compatibility layer")
+    parser.add_argument("--mode", choices=MODES, default=os.getenv("SHOGUN_COMM_MODE", "teams"))
+    parser.add_argument("--db", type=parse_path, default=default_db_path())
+    parser.add_argument("--mailbox-root", type=parse_path, default=default_mailbox_root())
+    parser.add_argument("--ntfy-base", default=os.getenv("SHOGUN_NTFY_BASE", "https://ntfy.sh"))
+    parser.add_argument("--ntfy-topic")
+    parser.add_argument("--ntfy-timeout", type=int, default=5)
+    parser.add_argument("--ntfy-spool", type=parse_path, default=default_ntfy_spool())
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Initialize comm layer state")
+    p_init.set_defaults(func=cmd_init)
+
+    p_send = sub.add_parser("send", help="Send message via selected mode")
+    p_send.add_argument("--from", dest="sender", required=True)
+    p_send.add_argument("--to")
+    p_send.add_argument("--broadcast", action="store_true")
+    p_send.add_argument("--content", required=True)
+    p_send.add_argument("--summary")
+    p_send.add_argument("--task-id", type=int)
+    p_send.add_argument("--nudge", default="nudge")
+    p_send.add_argument("--no-db-log", action="store_true", help="Skip logging to messages table")
+    p_send.set_defaults(func=cmd_send)
+
+    p_read = sub.add_parser("read", help="Read inbox for recipient")
+    p_read.add_argument("--name", required=True)
+    p_read.add_argument("--limit", type=int, default=100)
+    p_read.add_argument("--since-id", type=int)
+    p_read.add_argument("--mark-read", action="store_true")
+    p_read.add_argument("--unread-only", action="store_true")
+    p_read.add_argument("--json", action="store_true")
+    p_read.set_defaults(func=cmd_read)
+
+    p_nudge = sub.add_parser("nudge", help="Send short nudge token via tmux")
+    p_nudge.add_argument("--from", dest="sender", required=True)
+    p_nudge.add_argument("--to")
+    p_nudge.add_argument("--broadcast", action="store_true")
+    p_nudge.add_argument("--token", default="nudge")
+    p_nudge.set_defaults(func=cmd_nudge)
+
+    p_flush = sub.add_parser("flush", help="Delete inbox YAML files for recipient")
+    p_flush.add_argument("--name", required=True)
+    p_flush.set_defaults(func=cmd_flush)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    args.ntfy_base = args.ntfy_base
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

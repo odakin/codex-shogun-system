@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+ASHIGARU_COUNT=10
+SHOGUN_SESSION="shogun"
+MULTIAGENT_SESSION="multiagent"
+COMM_MODE="${SHOGUN_COMM_MODE:-teams}"
+START_WATCHERS=0
+
+usage() {
+  cat <<'EOF'
+Usage: bin/shogun-launch [--ashigaru N] [--shogun-session NAME] [--multiagent-session NAME] [--comm-mode MODE] [--watch]
+
+Environment:
+  SHOGUN_AGENT_BOOT_CMD  Optional command executed in each agent pane after setup.
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --ashigaru)
+      ASHIGARU_COUNT="$2"
+      shift 2
+      ;;
+    --shogun-session)
+      SHOGUN_SESSION="$2"
+      shift 2
+      ;;
+    --multiagent-session)
+      MULTIAGENT_SESSION="$2"
+      shift 2
+      ;;
+    --comm-mode)
+      COMM_MODE="$2"
+      shift 2
+      ;;
+    --watch)
+      START_WATCHERS=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "unknown option: $1" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+if ! command -v tmux >/dev/null 2>&1; then
+  echo "error: tmux is required" >&2
+  exit 1
+fi
+
+"$ROOT_DIR/bin/shogunctl" init >/dev/null
+"$ROOT_DIR/bin/shogunctl" seed-team --ashigaru "$ASHIGARU_COUNT" --reset >/dev/null
+"$ROOT_DIR/bin/shogun-comm" --mode "$COMM_MODE" init >/dev/null
+
+if tmux has-session -t "$SHOGUN_SESSION" 2>/dev/null; then
+  echo "error: tmux session '$SHOGUN_SESSION' already exists" >&2
+  exit 1
+fi
+if tmux has-session -t "$MULTIAGENT_SESSION" 2>/dev/null; then
+  echo "error: tmux session '$MULTIAGENT_SESSION' already exists" >&2
+  exit 1
+fi
+
+tmux new-session -d -s "$SHOGUN_SESSION" -n lead
+tmux send-keys -t "${SHOGUN_SESSION}:0.0" \
+  "cd \"$ROOT_DIR\"; export SHOGUN_NAME=shogun SHOGUN_ROLE=shogun SHOGUN_COMM_MODE=\"$COMM_MODE\"; clear; echo '[shogun/team_leader] delegate-only pane'; echo 'Use: bin/shogunctl status'; echo \"comm mode: $COMM_MODE\"; bin/shogunctl member set-status --name shogun --status working --session \"$SHOGUN_SESSION\" --pane 0 >/dev/null" C-m
+
+tmux new-session -d -s "$MULTIAGENT_SESSION" -n team
+TOTAL_PANES=$((ASHIGARU_COUNT + 2))
+for ((i=1; i<TOTAL_PANES; i++)); do
+  tmux split-window -t "${MULTIAGENT_SESSION}:0" -d
+  tmux select-layout -t "${MULTIAGENT_SESSION}:0" tiled >/dev/null
+done
+
+PANE_INDICES=($(tmux list-panes -t "${MULTIAGENT_SESSION}:0" -F '#{pane_index}' | sort -n))
+NAMES=("karo" "metsuke")
+ROLES=("karo" "metsuke")
+for ((i=1; i<=ASHIGARU_COUNT; i++)); do
+  NAMES+=("ashigaru${i}")
+  ROLES+=("ashigaru")
+done
+
+for idx in "${!NAMES[@]}"; do
+  pane="${PANE_INDICES[$idx]}"
+  name="${NAMES[$idx]}"
+  role="${ROLES[$idx]}"
+  WATCH_CMD=""
+  if [[ "$START_WATCHERS" -eq 1 ]]; then
+    WATCH_CMD="bin/shogun-mailbox-watch --name \"$name\" --mode \"$COMM_MODE\" --interval-sec 2 >/tmp/shogun-watch-$name.log 2>&1 &"
+  fi
+  tmux send-keys -t "${MULTIAGENT_SESSION}:0.${pane}" \
+    "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\"; clear; echo \"[$name/$role] ready\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD} if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi" C-m
+done
+
+echo "sessions created:"
+echo "  - $SHOGUN_SESSION (leader)"
+echo "  - $MULTIAGENT_SESSION (karo/metsuke/ashigaru*)"
+echo "comm mode: $COMM_MODE"
+if [[ "$START_WATCHERS" -eq 1 ]]; then
+  echo "watchers: enabled (logs in /tmp/shogun-watch-*.log)"
+fi
+echo
+echo "attach:"
+echo "  tmux attach -t $SHOGUN_SESSION"
+echo "  tmux attach -t $MULTIAGENT_SESSION"

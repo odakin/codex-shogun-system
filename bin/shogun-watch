@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+INTERVAL="${1:-5}"
+
+while true; do
+  clear
+  echo "UTC: $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+  echo
+  "$ROOT_DIR/bin/shogunctl" status
+  sleep "$INTERVAL"
+done
+

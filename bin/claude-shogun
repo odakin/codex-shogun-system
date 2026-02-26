@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export SHOGUN_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Agent Teams flag (Claude Code experimental)
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
+
+exec npx -y @anthropic-ai/claude-code --teammate-mode tmux "$@"
+

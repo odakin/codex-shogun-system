@@ -1,0 +1,9 @@
+state/*.db
+state/*.db-shm
+state/*.db-wal
+state/team-meta.json
+state/mailboxes/
+state/ntfy/
+.state/
+.pycache/
+__pycache__/

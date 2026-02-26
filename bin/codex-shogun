@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+export SHOGUN_ROOT="$(dirname "$SCRIPT_DIR")"
+
+# Codex orchestration entrypoint: bootstrap state + launch tmux team.
+exec "$SHOGUN_ROOT/bin/shogun-launch" "$@"
+

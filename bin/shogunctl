@@ -1,0 +1,705 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sqlite3
+import subprocess
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+TASK_STATUSES = ("todo", "in_progress", "blocked", "review", "done")
+MEMBER_STATUSES = ("idle", "working", "reviewing", "blocked", "offline")
+
+
+@dataclass
+class PolicyError(Exception):
+    message: str
+    delegate_to: str | None = None
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def ensure_state_dir(db_path: Path) -> None:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    ensure_state_dir(db_path)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS members (
+          name TEXT PRIMARY KEY,
+          role TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'idle',
+          session TEXT,
+          pane TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS tasks (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          subject TEXT NOT NULL,
+          description TEXT NOT NULL,
+          owner TEXT,
+          reporter TEXT,
+          reviewer TEXT,
+          status TEXT NOT NULL CHECK(status IN ('todo','in_progress','blocked','review','done')) DEFAULT 'todo',
+          priority INTEGER NOT NULL DEFAULT 2 CHECK(priority BETWEEN 1 AND 5),
+          parent_id INTEGER REFERENCES tasks(id),
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS task_events (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+          actor TEXT NOT NULL,
+          event_type TEXT NOT NULL,
+          detail TEXT,
+          created_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS messages (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          sender TEXT NOT NULL,
+          recipient TEXT NOT NULL,
+          kind TEXT NOT NULL CHECK(kind IN ('direct','broadcast','system')),
+          content TEXT NOT NULL,
+          task_id INTEGER REFERENCES tasks(id),
+          created_at TEXT NOT NULL,
+          read_at TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_tasks_owner_status ON tasks(owner, status);
+        CREATE INDEX IF NOT EXISTS idx_messages_recipient_read ON messages(recipient, read_at);
+        """
+    )
+
+
+def parse_db_path(arg: str) -> Path:
+    return Path(arg).expanduser().resolve()
+
+
+def as_dicts(rows: list[sqlite3.Row]) -> list[dict[str, object]]:
+    return [dict(row) for row in rows]
+
+
+def print_json(data: object) -> None:
+    print(json.dumps(data, ensure_ascii=True, indent=2))
+
+
+def format_rows(rows: list[sqlite3.Row], columns: list[str]) -> str:
+    if not rows:
+        return "(none)"
+    widths: dict[str, int] = {}
+    for col in columns:
+        widths[col] = len(col)
+    for row in rows:
+        for col in columns:
+            value = "" if row[col] is None else str(row[col])
+            widths[col] = max(widths[col], len(value))
+    header = "  ".join(col.ljust(widths[col]) for col in columns)
+    sep = "  ".join("-" * widths[col] for col in columns)
+    lines = [header, sep]
+    for row in rows:
+        lines.append(
+            "  ".join(
+                ("" if row[col] is None else str(row[col])).ljust(widths[col])
+                for col in columns
+            )
+        )
+    return "\n".join(lines)
+
+
+def is_ashigaru(name: str | None) -> bool:
+    return bool(name) and name.startswith("ashigaru")
+
+
+def enforce_policy(actor: str, action: str, target: str | None = None) -> None:
+    if actor != "shogun":
+        return
+    if action == "self_execute_task":
+        raise PolicyError(
+            "shogun is delegate-only and cannot execute shell/file tasks.",
+            delegate_to="karo",
+        )
+    if action in {"direct_ashigaru_command", "assign_task"} and is_ashigaru(target):
+        raise PolicyError(
+            "shogun cannot directly command ashigaru. Delegate through karo.",
+            delegate_to="karo",
+        )
+
+
+def log_task_event(
+    conn: sqlite3.Connection,
+    task_id: int,
+    actor: str,
+    event_type: str,
+    detail: str | None,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO task_events(task_id, actor, event_type, detail, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (task_id, actor, event_type, detail, utc_now()),
+    )
+
+
+def cmd_init(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        init_db(conn)
+    print(f"initialized: {args.db}")
+    return 0
+
+
+def cmd_seed_team(args: argparse.Namespace) -> int:
+    now = utc_now()
+    with connect(args.db) as conn:
+        init_db(conn)
+        if args.reset:
+            conn.execute("DELETE FROM members")
+        members: list[tuple[str, str]] = [
+            ("shogun", "team_leader"),
+            ("karo", "manager"),
+            ("metsuke", "reviewer"),
+        ]
+        members.extend((f"ashigaru{i}", "worker") for i in range(1, args.ashigaru + 1))
+        for name, role in members:
+            conn.execute(
+                """
+                INSERT INTO members(name, role, status, session, pane, created_at, updated_at)
+                VALUES (?, ?, 'idle', NULL, NULL, ?, ?)
+                ON CONFLICT(name) DO UPDATE SET
+                  role = excluded.role,
+                  updated_at = excluded.updated_at
+                """,
+                (name, role, now, now),
+            )
+    print(f"seeded members: {3 + args.ashigaru}")
+    return 0
+
+
+def cmd_member_list(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        rows = conn.execute(
+            """
+            SELECT name, role, status, COALESCE(session, '') AS session, COALESCE(pane, '') AS pane, updated_at
+            FROM members
+            ORDER BY
+              CASE role
+                WHEN 'team_leader' THEN 1
+                WHEN 'manager' THEN 2
+                WHEN 'reviewer' THEN 3
+                ELSE 4
+              END,
+              name
+            """
+        ).fetchall()
+    if args.json:
+        print_json(as_dicts(rows))
+    else:
+        print(format_rows(rows, ["name", "role", "status", "session", "pane", "updated_at"]))
+    return 0
+
+
+def cmd_member_set_status(args: argparse.Namespace) -> int:
+    now = utc_now()
+    with connect(args.db) as conn:
+        row = conn.execute("SELECT name FROM members WHERE name = ?", (args.name,)).fetchone()
+        if row is None:
+            print(f"error: unknown member '{args.name}'", file=sys.stderr)
+            return 1
+        conn.execute(
+            """
+            UPDATE members
+            SET status = ?, session = ?, pane = ?, updated_at = ?
+            WHERE name = ?
+            """,
+            (args.status, args.session, args.pane, now, args.name),
+        )
+    print(f"updated member: {args.name}")
+    return 0
+
+
+def cmd_task_create(args: argparse.Namespace) -> int:
+    actor = args.actor
+    if args.owner:
+        try:
+            enforce_policy(actor, "assign_task", target=args.owner)
+        except PolicyError as exc:
+            print(
+                f"DENY: {exc.message} delegate_to={exc.delegate_to}",
+                file=sys.stderr,
+            )
+            return 2
+    now = utc_now()
+    with connect(args.db) as conn:
+        init_db(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO tasks(
+              subject, description, owner, reporter, reviewer, status, priority, parent_id, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 'todo', ?, ?, ?, ?)
+            """,
+            (
+                args.subject,
+                args.description,
+                args.owner,
+                args.reporter or actor,
+                args.reviewer,
+                args.priority,
+                args.parent_id,
+                now,
+                now,
+            ),
+        )
+        task_id = int(cursor.lastrowid)
+        log_task_event(conn, task_id, actor, "create", args.description)
+    print(f"created task: {task_id}")
+    return 0
+
+
+def cmd_task_update(args: argparse.Namespace) -> int:
+    if not any((args.status, args.owner, args.reviewer, args.priority, args.subject, args.description)):
+        print("error: at least one update field is required", file=sys.stderr)
+        return 1
+
+    if args.owner:
+        try:
+            enforce_policy(args.actor, "assign_task", target=args.owner)
+        except PolicyError as exc:
+            print(
+                f"DENY: {exc.message} delegate_to={exc.delegate_to}",
+                file=sys.stderr,
+            )
+            return 2
+
+    now = utc_now()
+    with connect(args.db) as conn:
+        row = conn.execute("SELECT id FROM tasks WHERE id = ?", (args.id,)).fetchone()
+        if row is None:
+            print(f"error: unknown task id {args.id}", file=sys.stderr)
+            return 1
+
+        fields: list[str] = []
+        values: list[object] = []
+        for col, value in (
+            ("status", args.status),
+            ("owner", args.owner),
+            ("reviewer", args.reviewer),
+            ("priority", args.priority),
+            ("subject", args.subject),
+            ("description", args.description),
+        ):
+            if value is not None:
+                fields.append(f"{col} = ?")
+                values.append(value)
+        fields.append("updated_at = ?")
+        values.append(now)
+        values.append(args.id)
+        conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", values)
+
+        detail = json.dumps(
+            {
+                key: value
+                for key, value in {
+                    "status": args.status,
+                    "owner": args.owner,
+                    "reviewer": args.reviewer,
+                    "priority": args.priority,
+                    "subject": args.subject,
+                    "description": args.description,
+                }.items()
+                if value is not None
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+        log_task_event(conn, args.id, args.actor, "update", detail)
+    print(f"updated task: {args.id}")
+    return 0
+
+
+def cmd_task_list(args: argparse.Namespace) -> int:
+    query = """
+      SELECT id, subject, owner, status, priority, reporter, reviewer, updated_at
+      FROM tasks
+      WHERE 1 = 1
+    """
+    params: list[object] = []
+    if args.owner:
+        query += " AND owner = ?"
+        params.append(args.owner)
+    if args.status:
+        query += " AND status = ?"
+        params.append(args.status)
+    query += " ORDER BY priority ASC, id ASC LIMIT ?"
+    params.append(args.limit)
+
+    with connect(args.db) as conn:
+        rows = conn.execute(query, params).fetchall()
+
+    if args.json:
+        print_json(as_dicts(rows))
+    else:
+        print(format_rows(rows, ["id", "subject", "owner", "status", "priority", "reporter", "reviewer", "updated_at"]))
+    return 0
+
+
+def cmd_message_send(args: argparse.Namespace) -> int:
+    recipient = "*" if args.broadcast else args.to
+    if recipient is None:
+        print("error: --to is required unless --broadcast is set", file=sys.stderr)
+        return 1
+    action = "direct_ashigaru_command"
+    try:
+        enforce_policy(args.sender, action, target=recipient)
+    except PolicyError as exc:
+        print(
+            f"DENY: {exc.message} delegate_to={exc.delegate_to}",
+            file=sys.stderr,
+        )
+        return 2
+
+    kind = "broadcast" if args.broadcast else args.kind
+    with connect(args.db) as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO messages(sender, recipient, kind, content, task_id, created_at, read_at)
+            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            """,
+            (args.sender, recipient, kind, args.content, args.task_id, utc_now()),
+        )
+        msg_id = int(cursor.lastrowid)
+    print(f"sent message: {msg_id}")
+    return 0
+
+
+def cmd_message_inbox(args: argparse.Namespace) -> int:
+    query = """
+      SELECT id, sender, recipient, kind, content, task_id, created_at, read_at
+      FROM messages
+      WHERE recipient IN (?, '*')
+    """
+    params: list[object] = [args.name]
+    if args.unread_only:
+        query += " AND read_at IS NULL"
+    if args.since_id is not None:
+        query += " AND id > ?"
+        params.append(args.since_id)
+    query += " ORDER BY id ASC LIMIT ?"
+    params.append(args.limit)
+
+    with connect(args.db) as conn:
+        rows = conn.execute(query, params).fetchall()
+        ids = [row["id"] for row in rows]
+        if args.mark_read and ids:
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE messages SET read_at = ? WHERE id IN ({placeholders})",
+                [utc_now(), *ids],
+            )
+
+    if args.json:
+        print_json(as_dicts(rows))
+    else:
+        print(format_rows(rows, ["id", "sender", "recipient", "kind", "task_id", "created_at", "read_at", "content"]))
+    return 0
+
+
+def cmd_status(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        members = conn.execute(
+            """
+            SELECT name, role, status, COALESCE(session, '') AS session, COALESCE(pane, '') AS pane
+            FROM members
+            ORDER BY
+              CASE role
+                WHEN 'team_leader' THEN 1
+                WHEN 'manager' THEN 2
+                WHEN 'reviewer' THEN 3
+                ELSE 4
+              END,
+              name
+            """
+        ).fetchall()
+        task_summary = conn.execute(
+            """
+            SELECT status, COUNT(*) AS count
+            FROM tasks
+            GROUP BY status
+            ORDER BY
+              CASE status
+                WHEN 'todo' THEN 1
+                WHEN 'in_progress' THEN 2
+                WHEN 'blocked' THEN 3
+                WHEN 'review' THEN 4
+                WHEN 'done' THEN 5
+              END
+            """
+        ).fetchall()
+        inbox_summary = conn.execute(
+            """
+            SELECT recipient AS name, COUNT(*) AS unread
+            FROM messages
+            WHERE read_at IS NULL AND recipient != '*'
+            GROUP BY recipient
+            ORDER BY recipient
+            """
+        ).fetchall()
+        broadcast_unread = conn.execute(
+            "SELECT COUNT(*) AS unread FROM messages WHERE read_at IS NULL AND recipient = '*'"
+        ).fetchone()
+
+    print("== Members ==")
+    print(format_rows(members, ["name", "role", "status", "session", "pane"]))
+    print()
+    print("== Tasks ==")
+    print(format_rows(task_summary, ["status", "count"]))
+    print()
+    print("== Unread Direct Messages ==")
+    print(format_rows(inbox_summary, ["name", "unread"]))
+    print()
+    print(f"unread broadcast messages: {broadcast_unread['unread']}")
+    return 0
+
+
+def cmd_agent_sync(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        tasks = conn.execute(
+            """
+            SELECT id, subject, description, status, priority, reporter, reviewer, updated_at
+            FROM tasks
+            WHERE owner = ? AND status != 'done'
+            ORDER BY priority ASC, id ASC
+            """,
+            (args.name,),
+        ).fetchall()
+        messages = conn.execute(
+            """
+            SELECT id, sender, recipient, kind, content, task_id, created_at
+            FROM messages
+            WHERE recipient IN (?, '*') AND read_at IS NULL
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (args.name, args.limit),
+        ).fetchall()
+
+        if args.mark_read and messages:
+            ids = [row["id"] for row in messages]
+            placeholders = ",".join("?" for _ in ids)
+            conn.execute(
+                f"UPDATE messages SET read_at = ? WHERE id IN ({placeholders})",
+                [utc_now(), *ids],
+            )
+
+    payload = {
+        "member": args.name,
+        "tasks": as_dicts(tasks),
+        "messages": as_dicts(messages),
+    }
+    print_json(payload)
+    return 0
+
+
+def cmd_policy_check(args: argparse.Namespace) -> int:
+    try:
+        enforce_policy(args.actor, args.action, target=args.target)
+    except PolicyError as exc:
+        print(
+            f"DENY: actor={args.actor} action={args.action} target={args.target} delegate_to={exc.delegate_to}",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"ALLOW: actor={args.actor} action={args.action} target={args.target}")
+    return 0
+
+
+def cmd_reset(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        init_db(conn)
+        conn.execute("DELETE FROM task_events")
+        conn.execute("DELETE FROM messages")
+        conn.execute("DELETE FROM tasks")
+        if args.hard:
+            conn.execute("DELETE FROM members")
+        else:
+            conn.execute(
+                """
+                UPDATE members
+                SET status = 'idle', session = NULL, pane = NULL, updated_at = ?
+                """,
+                (utc_now(),),
+            )
+    if args.hard:
+        print("reset complete: tasks/messages/events cleared, members removed")
+    else:
+        print("reset complete: tasks/messages/events cleared, members set to idle")
+    return 0
+
+
+def cmd_exec(args: argparse.Namespace) -> int:
+    try:
+        enforce_policy(args.actor, "self_execute_task")
+    except PolicyError as exc:
+        print(
+            f"DENY: {exc.message} delegate_to={exc.delegate_to}",
+            file=sys.stderr,
+        )
+        return 2
+
+    result = subprocess.run(args.command, shell=True, cwd=args.cwd)
+    return result.returncode
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Shogun team control plane")
+    parser.add_argument(
+        "--db",
+        type=parse_db_path,
+        default=default_db_path(),
+        help="Path to SQLite database (default: state/shogun.db)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p_init = sub.add_parser("init", help="Initialize SQLite state")
+    p_init.set_defaults(func=cmd_init)
+
+    p_seed = sub.add_parser("seed-team", help="Seed default team members")
+    p_seed.add_argument("--ashigaru", type=int, default=10, help="Number of ashigaru workers")
+    p_seed.add_argument("--reset", action="store_true", help="Delete existing members before seeding")
+    p_seed.set_defaults(func=cmd_seed_team)
+
+    p_member = sub.add_parser("member", help="Member operations")
+    p_member_sub = p_member.add_subparsers(dest="member_command", required=True)
+
+    p_member_list = p_member_sub.add_parser("list", help="List members")
+    p_member_list.add_argument("--json", action="store_true", help="Output JSON")
+    p_member_list.set_defaults(func=cmd_member_list)
+
+    p_member_set = p_member_sub.add_parser("set-status", help="Update member status/session metadata")
+    p_member_set.add_argument("--name", required=True)
+    p_member_set.add_argument("--status", choices=MEMBER_STATUSES, required=True)
+    p_member_set.add_argument("--session")
+    p_member_set.add_argument("--pane")
+    p_member_set.set_defaults(func=cmd_member_set_status)
+
+    p_task = sub.add_parser("task", help="Task operations")
+    p_task_sub = p_task.add_subparsers(dest="task_command", required=True)
+
+    p_task_create = p_task_sub.add_parser("create", help="Create a task")
+    p_task_create.add_argument("--actor", default="system")
+    p_task_create.add_argument("--owner")
+    p_task_create.add_argument("--reporter")
+    p_task_create.add_argument("--reviewer")
+    p_task_create.add_argument("--subject", required=True)
+    p_task_create.add_argument("--description", required=True)
+    p_task_create.add_argument("--priority", type=int, choices=range(1, 6), default=2)
+    p_task_create.add_argument("--parent-id", type=int)
+    p_task_create.set_defaults(func=cmd_task_create)
+
+    p_task_update = p_task_sub.add_parser("update", help="Update a task")
+    p_task_update.add_argument("--id", type=int, required=True)
+    p_task_update.add_argument("--actor", default="system")
+    p_task_update.add_argument("--status", choices=TASK_STATUSES)
+    p_task_update.add_argument("--owner")
+    p_task_update.add_argument("--reviewer")
+    p_task_update.add_argument("--priority", type=int, choices=range(1, 6))
+    p_task_update.add_argument("--subject")
+    p_task_update.add_argument("--description")
+    p_task_update.set_defaults(func=cmd_task_update)
+
+    p_task_list = p_task_sub.add_parser("list", help="List tasks")
+    p_task_list.add_argument("--owner")
+    p_task_list.add_argument("--status", choices=TASK_STATUSES)
+    p_task_list.add_argument("--limit", type=int, default=100)
+    p_task_list.add_argument("--json", action="store_true")
+    p_task_list.set_defaults(func=cmd_task_list)
+
+    p_msg = sub.add_parser("message", help="Message operations")
+    p_msg_sub = p_msg.add_subparsers(dest="message_command", required=True)
+
+    p_msg_send = p_msg_sub.add_parser("send", help="Send message")
+    p_msg_send.add_argument("--from", dest="sender", required=True)
+    p_msg_send.add_argument("--to")
+    p_msg_send.add_argument("--broadcast", action="store_true")
+    p_msg_send.add_argument("--kind", choices=("direct", "system"), default="direct")
+    p_msg_send.add_argument("--task-id", type=int)
+    p_msg_send.add_argument("--content", required=True)
+    p_msg_send.set_defaults(func=cmd_message_send)
+
+    p_msg_inbox = p_msg_sub.add_parser("inbox", help="Read inbox")
+    p_msg_inbox.add_argument("--name", required=True)
+    p_msg_inbox.add_argument("--unread-only", action="store_true")
+    p_msg_inbox.add_argument("--since-id", type=int)
+    p_msg_inbox.add_argument("--mark-read", action="store_true")
+    p_msg_inbox.add_argument("--limit", type=int, default=200)
+    p_msg_inbox.add_argument("--json", action="store_true")
+    p_msg_inbox.set_defaults(func=cmd_message_inbox)
+
+    p_status = sub.add_parser("status", help="Show dashboard summary")
+    p_status.set_defaults(func=cmd_status)
+
+    p_agent_sync = sub.add_parser("agent-sync", help="Output assigned tasks + unread messages as JSON")
+    p_agent_sync.add_argument("--name", required=True)
+    p_agent_sync.add_argument("--limit", type=int, default=200)
+    p_agent_sync.add_argument("--mark-read", action="store_true")
+    p_agent_sync.set_defaults(func=cmd_agent_sync)
+
+    p_policy = sub.add_parser("policy-check", help="Check delegate policy")
+    p_policy.add_argument("--actor", required=True)
+    p_policy.add_argument(
+        "--action",
+        choices=("self_execute_task", "direct_ashigaru_command", "assign_task"),
+        required=True,
+    )
+    p_policy.add_argument("--target")
+    p_policy.set_defaults(func=cmd_policy_check)
+
+    p_reset = sub.add_parser("reset", help="Clear state tables")
+    p_reset.add_argument("--hard", action="store_true", help="Also remove members")
+    p_reset.set_defaults(func=cmd_reset)
+
+    p_exec = sub.add_parser("exec", help="Execute shell command with role policy guard")
+    p_exec.add_argument("--actor", required=True)
+    p_exec.add_argument("--cwd", default=str(root_dir()))
+    p_exec.add_argument("--command", required=True)
+    p_exec.set_defaults(func=cmd_exec)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
