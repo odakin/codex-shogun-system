@@ -14,10 +14,15 @@ SHOW_FEED="${SHOGUN_SHOW_FEED:-1}"
 FEED_TAIL_EVENTS="${SHOGUN_FEED_TAIL_EVENTS:-0}"
 FEED_TAIL_MESSAGES="${SHOGUN_FEED_TAIL_MESSAGES:-0}"
 FEED_INTERVAL="${SHOGUN_FEED_INTERVAL:-1}"
+FEED_TRUNCATE="${SHOGUN_FEED_TRUNCATE:-0}"
 
 usage() {
   cat <<'EOF'
-Usage: bin/shogun-launch [--ashigaru N] [--shogun-session NAME] [--multiagent-session NAME] [--comm-mode MODE] [--watch] [--autopilot|--no-autopilot] [--agent-interval SEC] [--leader-watch|--no-leader-watch] [--feed|--no-feed]
+Usage: bin/shogun-launch [--ashigaru N] [--shogun-session NAME] [--multiagent-session NAME] [--comm-mode MODE] [--watch]
+                        [--autopilot|--no-autopilot] [--agent-interval SEC]
+                        [--leader-watch|--no-leader-watch]
+                        [--feed|--no-feed] [--feed-tail-events N] [--feed-tail-messages N]
+                        [--feed-interval SEC] [--feed-truncate N]
 
 Environment:
   SHOGUN_AGENT_BOOT_CMD  Optional command executed in each agent pane after setup.
@@ -86,6 +91,10 @@ while [[ $# -gt 0 ]]; do
       FEED_INTERVAL="$2"
       shift 2
       ;;
+    --feed-truncate)
+      FEED_TRUNCATE="$2"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -128,7 +137,7 @@ tmux send-keys -t "${SHOGUN_SESSION}:0.0" \
 if [[ "$SHOW_FEED" -eq 1 ]]; then
   tmux split-window -t "${SHOGUN_SESSION}:0.0" -v -p 45
   tmux send-keys -t "${SHOGUN_SESSION}:0.1" \
-    "cd \"$ROOT_DIR\"; clear; echo '[軍議録] 全隊のやり取りを常時表示'; exec bin/shogun-feed --tail-events \"$FEED_TAIL_EVENTS\" --tail-messages \"$FEED_TAIL_MESSAGES\" --interval-sec \"$FEED_INTERVAL\"" C-m
+    "cd \"$ROOT_DIR\"; clear; echo '[軍議録] 全隊のやり取りを常時表示'; exec bin/shogun-feed --tail-events \"$FEED_TAIL_EVENTS\" --tail-messages \"$FEED_TAIL_MESSAGES\" --truncate \"$FEED_TRUNCATE\" --interval-sec \"$FEED_INTERVAL\"" C-m
   tmux select-pane -t "${SHOGUN_SESSION}:0.0"
 fi
 

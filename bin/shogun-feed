@@ -35,6 +35,24 @@ def preview(text: object, limit: int = 96) -> str:
     return value[: limit - 3] + "..."
 
 
+def maybe_truncate(text: object, limit: int) -> str:
+    if text is None:
+        return ""
+    raw = str(text)
+    if limit <= 0:
+        return raw
+    return preview(raw, limit=limit)
+
+
+def print_multiline(label: str, text: str) -> None:
+    print(label, flush=True)
+    if not text:
+        print("  (empty)", flush=True)
+        return
+    for line in text.splitlines():
+        print(f"  {line}", flush=True)
+
+
 def fetch_tail_events(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
     if n <= 0:
         rows = conn.execute(
@@ -135,26 +153,28 @@ def max_ids(conn: sqlite3.Connection) -> tuple[int, int]:
     return int(ev["m"]), int(msg["m"])
 
 
-def print_event(row: sqlite3.Row) -> None:
-    subject = preview(row["subject"], limit=42)
-    detail = preview(row["detail"], limit=84)
+def print_event(row: sqlite3.Row, truncate: int) -> None:
+    subject = maybe_truncate(row["subject"], truncate)
+    detail = maybe_truncate(row["detail"], truncate)
     print(
         f"[event#{row['id']}] {row['created_at']} "
         f"task#{row['task_id']} actor={row['actor']} type={row['event_type']} "
-        f"subject=\"{subject}\" detail=\"{detail}\"",
+        f"subject=\"{subject}\"",
         flush=True,
     )
+    print_multiline("detail:", detail)
 
 
-def print_message(row: sqlite3.Row) -> None:
-    content = preview(row["content"], limit=110)
+def print_message(row: sqlite3.Row, truncate: int) -> None:
+    content = maybe_truncate(row["content"], truncate)
     task_id = "-" if row["task_id"] is None else str(row["task_id"])
     print(
         f"[msg#{row['id']}] {row['created_at']} "
         f"{row['sender']} -> {row['recipient']} kind={row['kind']} task={task_id} "
-        f"\"{content}\"",
+        f"content:",
         flush=True,
     )
+    print_multiline("", content)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -167,9 +187,9 @@ def run(args: argparse.Namespace) -> int:
             tail_events = fetch_tail_events(conn, args.tail_events)
             tail_messages = fetch_tail_messages(conn, args.tail_messages)
             for row in tail_events:
-                print_event(row)
+                print_event(row, args.truncate)
             for row in tail_messages:
-                print_message(row)
+                print_message(row, args.truncate)
             last_event_id = tail_events[-1]["id"] if tail_events else max_ids(conn)[0]
             last_msg_id = tail_messages[-1]["id"] if tail_messages else max_ids(conn)[1]
 
@@ -180,10 +200,10 @@ def run(args: argparse.Namespace) -> int:
             events = fetch_new_events(conn, last_event_id, args.batch_limit)
             messages = fetch_new_messages(conn, last_msg_id, args.batch_limit)
             for row in events:
-                print_event(row)
+                print_event(row, args.truncate)
                 last_event_id = int(row["id"])
             for row in messages:
-                print_message(row)
+                print_message(row, args.truncate)
                 last_msg_id = int(row["id"])
             time.sleep(max(0.2, args.interval_sec))
 
@@ -194,6 +214,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail-events", type=int, default=0, help="0 means all events")
     parser.add_argument("--tail-messages", type=int, default=0, help="0 means all messages")
     parser.add_argument("--no-tail", action="store_true")
+    parser.add_argument("--truncate", type=int, default=0, help="0 means full text")
     parser.add_argument("--interval-sec", type=float, default=1.0)
     parser.add_argument("--batch-limit", type=int, default=200)
     parser.add_argument("--once", action="store_true")

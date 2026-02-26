@@ -47,6 +47,7 @@ bin/shogun-launch --ashigaru 10 --comm-mode teams
 - `autopilot=ON`（家老/目付/足軽が自動稼働）
 - `leader-watch=ON`（将軍paneで受信早馬を表示）
 - `feed=ON`（将軍ウィンドウで全隊の task/message を常時表示）
+  - `feed-truncate=0`（要約せず全文表示）
 - 直前の task/message/event をクリアしてから起動
 
 Attach:
@@ -126,7 +127,12 @@ bin/shogun-agent --name karo --role karo --mode teams --once
 - `--leader-watch / --no-leader-watch`: 将軍paneの受信早馬表示ON/OFF
 - `--feed / --no-feed`: 将軍ウィンドウの全隊フィード表示ON/OFF
 - `--feed-tail-events N --feed-tail-messages N --feed-interval SEC`: フィード表示調整（`N=0` は全件）
+- `--feed-truncate N`: フィード文字数制限（`0` は要約なし全文）
 - `--watch`: 旧watchログを `/tmp/shogun-watch-*.log` へ保存
+
+`bin/shogun-agent` options:
+
+- `--output-max-chars N`: 実行ログをメッセージに含める最大文字数（`0` は無制限）
 
 Reset runtime data:
 

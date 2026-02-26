@@ -249,9 +249,6 @@ case "$cmd" in
     if [[ "$force_direct" -eq 0 ]] && ([[ "$strict_mode" != "0" ]] || [[ "$force_delegate" -eq 1 ]]); then
       if [[ -z "$subject" ]]; then
         one_line_cmd="$(printf '%s' "$run_cmd" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
-        if [[ ${#one_line_cmd} -gt 72 ]]; then
-          one_line_cmd="${one_line_cmd:0:69}..."
-        fi
         subject="軍令: $one_line_cmd"
       fi
       if [[ -z "$description" ]]; then

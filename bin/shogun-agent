@@ -60,6 +60,15 @@ def short(text: str, limit: int = 96) -> str:
     return value[: limit - 3] + "..."
 
 
+def truncate_chars(text: str, limit: int) -> str:
+    if limit <= 0 or len(text) <= limit:
+        return text
+    marker = "\n\n[truncated]"
+    if limit <= len(marker):
+        return marker[:limit]
+    return text[: limit - len(marker)] + marker
+
+
 def parse_created_task_id(output: str) -> int:
     match = re.search(r"(?:created task:\s*|id[=: ]+)(\d+)", output)
     if not match:
@@ -292,16 +301,18 @@ def extract_command(text: str) -> str | None:
     return None
 
 
-def summarize_process_output(stdout: str, stderr: str, max_lines: int = 8) -> str:
-    merged = []
-    if stdout.strip():
-        merged.extend(stdout.strip().splitlines())
-    if stderr.strip():
-        merged.extend(stderr.strip().splitlines())
-    if not merged:
+def format_process_output(stdout: str, stderr: str, max_chars: int) -> str:
+    sections: list[str] = []
+    out = stdout.rstrip()
+    err = stderr.rstrip()
+    if out:
+        sections.append(f"stdout:\n{out}")
+    if err:
+        sections.append(f"stderr:\n{err}")
+    if not sections:
         return "(no output)"
-    tail = merged[-max_lines:]
-    return "\n".join(tail)
+    merged = "\n\n".join(sections)
+    return truncate_chars(merged, max_chars)
 
 
 def run_shell(command: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str, bool]:
@@ -337,7 +348,7 @@ def make_child_description(parent: dict[str, object], command: str | None) -> st
         [
             "",
             "完了条件:",
-            "- 実行結果を要約し、status=review に更新すること。",
+            "- 実行ログを添えて status=review に更新すること。",
             "- ブロッカーがあれば status=blocked とし報告すること。",
         ]
     )
@@ -347,8 +358,10 @@ def make_child_description(parent: dict[str, object], command: str | None) -> st
 def announce_inbox(agent_label: str, messages: list[dict[str, object]]) -> None:
     for msg in messages:
         sender = str(msg.get("sender") or "?")
-        content = short(str(msg.get("content") or ""), limit=100)
-        narrate(agent_label, f"早馬着信: {sender}曰く「{content}」")
+        content = str(msg.get("content") or "").strip() or "(empty)"
+        narrate(agent_label, f"早馬着信: {sender} 曰く")
+        for line in content.splitlines():
+            narrate(agent_label, f"  {line}")
 
 
 def cycle_karo(args: argparse.Namespace) -> str:
@@ -463,7 +476,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
         if command:
             narrate(label, f"任務 #{task_id} 実行: {short(command, 80)}")
             code, out, err, timed_out = run_shell(command, args.workdir, args.max_command_sec)
-            summary = summarize_process_output(out, err)
+            execution_log = format_process_output(out, err, args.output_max_chars)
             if timed_out:
                 task_update(args.db, task_id, args.name, status="blocked")
                 shogun_comm_send(
@@ -471,7 +484,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     args.mode,
                     args.name,
                     "karo",
-                    f"家老殿、任務 #{task_id} は時限超過にて中断。\n{summary}",
+                    f"家老殿、任務 #{task_id} は時限超過にて中断。\n実行ログ:\n{execution_log}",
                     task_id=task_id,
                     summary=f"timeout {task_id}",
                 )
@@ -484,7 +497,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     args.mode,
                     args.name,
                     "karo",
-                    f"家老殿、任務 #{task_id} 失敗（exit={code}）。\n{summary}",
+                    f"家老殿、任務 #{task_id} 失敗（exit={code}）。\n実行ログ:\n{execution_log}",
                     task_id=task_id,
                     summary=f"failed {task_id}",
                 )
@@ -493,7 +506,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
             task_update(args.db, task_id, args.name, status="review")
             ok_message = (
                 f"家老殿、任務 #{task_id} 仕上げ候。目付殿の検分を願う。\n"
-                f"抜粋:\n{summary}"
+                f"実行ログ:\n{execution_log}"
             )
             shogun_comm_send(args.db, args.mode, args.name, "karo", ok_message, task_id=task_id, summary=f"ready {task_id}")
             shogun_comm_send(
@@ -617,6 +630,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--interval-sec", type=float, default=2.0)
     parser.add_argument("--inbox-limit", type=int, default=100)
     parser.add_argument("--max-command-sec", type=int, default=180)
+    parser.add_argument(
+        "--output-max-chars",
+        type=int,
+        default=int(os.getenv("SHOGUN_AGENT_OUTPUT_MAX_CHARS", "4000")),
+        help="0 means no truncation",
+    )
     parser.add_argument("--workdir", type=parse_path, default=root_dir())
     parser.add_argument("--once", action="store_true")
     return parser
