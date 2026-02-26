@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import sqlite3
+import sys
+import time
+from pathlib import Path
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def parse_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def preview(text: object, limit: int = 96) -> str:
+    value = "" if text is None else str(text)
+    value = " ".join(value.splitlines()).strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def fetch_tail_events(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
+    if n <= 0:
+        return []
+    rows = conn.execute(
+        """
+        SELECT
+          e.id,
+          e.task_id,
+          COALESCE(t.subject, '') AS subject,
+          e.actor,
+          e.event_type,
+          COALESCE(e.detail, '') AS detail,
+          e.created_at
+        FROM task_events e
+        LEFT JOIN tasks t ON t.id = e.task_id
+        ORDER BY e.id DESC
+        LIMIT ?
+        """,
+        (n,),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def fetch_tail_messages(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
+    if n <= 0:
+        return []
+    rows = conn.execute(
+        """
+        SELECT id, sender, recipient, kind, task_id, created_at, content
+        FROM messages
+        ORDER BY id DESC
+        LIMIT ?
+        """,
+        (n,),
+    ).fetchall()
+    return list(reversed(rows))
+
+
+def fetch_new_events(conn: sqlite3.Connection, after_id: int, limit: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+          e.id,
+          e.task_id,
+          COALESCE(t.subject, '') AS subject,
+          e.actor,
+          e.event_type,
+          COALESCE(e.detail, '') AS detail,
+          e.created_at
+        FROM task_events e
+        LEFT JOIN tasks t ON t.id = e.task_id
+        WHERE e.id > ?
+        ORDER BY e.id ASC
+        LIMIT ?
+        """,
+        (after_id, limit),
+    ).fetchall()
+
+
+def fetch_new_messages(conn: sqlite3.Connection, after_id: int, limit: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, sender, recipient, kind, task_id, created_at, content
+        FROM messages
+        WHERE id > ?
+        ORDER BY id ASC
+        LIMIT ?
+        """,
+        (after_id, limit),
+    ).fetchall()
+
+
+def max_ids(conn: sqlite3.Connection) -> tuple[int, int]:
+    ev = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM task_events").fetchone()
+    msg = conn.execute("SELECT COALESCE(MAX(id), 0) AS m FROM messages").fetchone()
+    return int(ev["m"]), int(msg["m"])
+
+
+def print_event(row: sqlite3.Row) -> None:
+    subject = preview(row["subject"], limit=42)
+    detail = preview(row["detail"], limit=84)
+    print(
+        f"[event#{row['id']}] {row['created_at']} "
+        f"task#{row['task_id']} actor={row['actor']} type={row['event_type']} "
+        f"subject=\"{subject}\" detail=\"{detail}\"",
+        flush=True,
+    )
+
+
+def print_message(row: sqlite3.Row) -> None:
+    content = preview(row["content"], limit=110)
+    task_id = "-" if row["task_id"] is None else str(row["task_id"])
+    print(
+        f"[msg#{row['id']}] {row['created_at']} "
+        f"{row['sender']} -> {row['recipient']} kind={row['kind']} task={task_id} "
+        f"\"{content}\"",
+        flush=True,
+    )
+
+
+def run(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        print(f"[軍議録] db={args.db}", flush=True)
+
+        if args.no_tail:
+            last_event_id, last_msg_id = max_ids(conn)
+        else:
+            tail_events = fetch_tail_events(conn, args.tail_events)
+            tail_messages = fetch_tail_messages(conn, args.tail_messages)
+            for row in tail_events:
+                print_event(row)
+            for row in tail_messages:
+                print_message(row)
+            last_event_id = tail_events[-1]["id"] if tail_events else max_ids(conn)[0]
+            last_msg_id = tail_messages[-1]["id"] if tail_messages else max_ids(conn)[1]
+
+        if args.once:
+            return 0
+
+        while True:
+            events = fetch_new_events(conn, last_event_id, args.batch_limit)
+            messages = fetch_new_messages(conn, last_msg_id, args.batch_limit)
+            for row in events:
+                print_event(row)
+                last_event_id = int(row["id"])
+            for row in messages:
+                print_message(row)
+                last_msg_id = int(row["id"])
+            time.sleep(max(0.2, args.interval_sec))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Live feed of shogun task events/messages")
+    parser.add_argument("--db", type=parse_path, default=default_db_path())
+    parser.add_argument("--tail-events", type=int, default=18)
+    parser.add_argument("--tail-messages", type=int, default=24)
+    parser.add_argument("--no-tail", action="store_true")
+    parser.add_argument("--interval-sec", type=float, default=1.0)
+    parser.add_argument("--batch-limit", type=int, default=200)
+    parser.add_argument("--once", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return run(args)
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:  # pragma: no cover
+        print(f"[軍議録] error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+

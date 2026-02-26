@@ -46,6 +46,7 @@ bin/shogun-launch --ashigaru 10 --comm-mode teams
 - `ashigaru=10`
 - `autopilot=ON`（家老/目付/足軽が自動稼働）
 - `leader-watch=ON`（将軍paneで受信早馬を表示）
+- `feed=ON`（将軍ウィンドウで全隊の task/message を常時表示）
 - 直前の task/message/event をクリアしてから起動
 
 Attach:
@@ -123,6 +124,8 @@ bin/shogun-agent --name karo --role karo --mode teams --once
 - `--no-autopilot`: 自動稼働を無効化（手動操作のみ）
 - `--agent-interval SEC`: 自動稼働ループの周期
 - `--leader-watch / --no-leader-watch`: 将軍paneの受信早馬表示ON/OFF
+- `--feed / --no-feed`: 将軍ウィンドウの全隊フィード表示ON/OFF
+- `--feed-tail-events N --feed-tail-messages N --feed-interval SEC`: フィード表示調整
 - `--watch`: 旧watchログを `/tmp/shogun-watch-*.log` へ保存
 
 Reset runtime data:
