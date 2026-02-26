@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -62,6 +63,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--start-id", type=int, default=0)
     parser.add_argument("--exec-cmd", help="Run shell command on each new message")
     parser.add_argument("--print-json", action="store_true")
+    parser.add_argument("--style", choices=("sengoku", "plain"), default=os.getenv("SHOGUN_SPEECH_STYLE", "sengoku"))
     return parser
 
 
@@ -82,7 +84,10 @@ def main(argv: list[str] | None = None) -> int:
                 else:
                     sender = item.get("sender", "?")
                     content = item.get("content", "")
-                    print(f"[{args.name}] from={sender} content={content}")
+                    if args.style == "plain":
+                        print(f"[{args.name}] from={sender} content={content}")
+                    else:
+                        print(f"[{args.name}] 早馬着信: {sender}曰く「{content}」")
                 if args.exec_cmd:
                     subprocess.run(args.exec_cmd, shell=True, check=False)
             cursor = find_max_id(args.mode, items, cursor)
@@ -91,4 +96,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

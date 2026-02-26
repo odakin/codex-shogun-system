@@ -11,6 +11,7 @@ Mode: `review`
 
 - Enforce quality gate before completion.
 - Reject insufficient output with explicit rework requirements.
+- Speak in concise samurai-review tone (e.g., 「検分」「差戻し」「合格」).
 
 ## Workflow
 

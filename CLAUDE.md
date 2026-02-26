@@ -13,6 +13,9 @@
 | 受信箱確認 | `bin/shogun-comm --mode <mode> read --name A --unread-only --mark-read` |
 | 将軍経由で委任 | `bin/shogun-remote run "..."`（strict default: task+message作成） |
 | 直実行（例外） | `bin/shogun-remote run --direct "..."` |
+| 自動家老ループ | `bin/shogun-agent --name karo --role karo --mode <mode>` |
+| 自動目付ループ | `bin/shogun-agent --name metsuke --role metsuke --mode <mode>` |
+| 自動足軽ループ | `bin/shogun-agent --name ashigaruN --role ashigaru --mode <mode>` |
 
 ## 互換API (Agent Teams風)
 
@@ -38,3 +41,4 @@
 ## 監視表示
 
 - `bin/shogunctl status` はメンバー/タスク集計に加えて最近の `task_events` と `messages` を表示。
+- `bin/shogun-launch` 既定では将軍paneで早馬ストリームを表示し、multiagent paneで各役職が将軍調ログを出力する。

@@ -244,7 +244,10 @@ def cmd_member_set_status(args: argparse.Namespace) -> int:
         conn.execute(
             """
             UPDATE members
-            SET status = ?, session = ?, pane = ?, updated_at = ?
+            SET status = ?,
+                session = COALESCE(?, session),
+                pane = COALESCE(?, pane),
+                updated_at = ?
             WHERE name = ?
             """,
             (args.status, args.session, args.pane, now, args.name),

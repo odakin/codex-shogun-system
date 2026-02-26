@@ -97,11 +97,12 @@ create_delegated_task() {
 
   msg_content=$(
     cat <<EOF
-Task #$task_id を委任する。
+軍令:
+任務 #$task_id を委任する。
 command:
 $run_cmd
 
-完了後は task update で status=done とし、将軍へ報告せよ。
+完了後は status=done とし、将軍へ戦果を報告せよ。
 EOF
   )
 
@@ -114,8 +115,8 @@ EOF
     --summary "delegated command #$task_id" \
     --content "$msg_content" >/dev/null
 
-  echo "delegated task created: id=$task_id owner=$owner recipient=$recipient comm_mode=$comm_mode"
-  echo "subject: $subject"
+  echo "[将軍] 委任完了: task=$task_id owner=$owner recipient=$recipient mode=$comm_mode"
+  echo "[将軍] 件名: $subject"
 }
 
 require_tmux
@@ -251,12 +252,12 @@ case "$cmd" in
         if [[ ${#one_line_cmd} -gt 72 ]]; then
           one_line_cmd="${one_line_cmd:0:69}..."
         fi
-        subject="Delegate command: $one_line_cmd"
+        subject="軍令: $one_line_cmd"
       fi
       if [[ -z "$description" ]]; then
         description=$(
           cat <<EOF
-Delegated by shogun-remote strict mode.
+将軍より strict 委任（shogun-remote）。
 
 command:
 $run_cmd

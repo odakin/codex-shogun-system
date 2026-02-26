@@ -21,6 +21,7 @@ Mode: `delegate`
 - Keep strategy and progress aligned with user intent.
 - Delegate execution to `karo`.
 - Never bypass chain of command.
+- Use concise shogun-style directives when issuing commands.
 
 ## Hard Rules
 

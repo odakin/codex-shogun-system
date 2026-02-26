@@ -11,6 +11,11 @@ Codex向けに実装した、戦国風マルチエージェント運用基盤で
 
 - tmuxベースの2セッション運用（`shogun` / `multiagent`）
 - 共有タスク・メッセージ基盤（SQLite）
+- 自動稼働エージェント（`bin/shogun-agent`）:
+  - `karo`: タスク分配と完了上申
+  - `ashigaru*`: 実行とレビュー送致
+  - `metsuke`: 検分（review -> done）
+- 将軍画面への早馬ストリーム表示（将軍調ログ）
 - 通信方式の切替:
   - `teams`（共有メッセージング）
   - `sendkeys`（Gen1）
@@ -35,6 +40,13 @@ bin/shogunctl init
 bin/shogunctl seed-team --ashigaru 10 --reset
 bin/shogun-launch --ashigaru 10 --comm-mode teams
 ```
+
+`bin/shogun-launch` は既定で:
+
+- `ashigaru=10`
+- `autopilot=ON`（家老/目付/足軽が自動稼働）
+- `leader-watch=ON`（将軍paneで受信早馬を表示）
+- 直前の task/message/event をクリアしてから起動
 
 Attach:
 
@@ -97,6 +109,7 @@ bin/shogun-remote run --direct "bin/shogunctl status"  # direct run (bypass stri
 bin/shogun-watch 5
 bin/shogun-watchdog --task-timeout-min 10 --member-timeout-min 10 --dry-run
 bin/shogun-autoflow --json
+bin/shogun-agent --name karo --role karo --mode teams --once
 ```
 
 `bin/shogun-remote run` is strict by default (`SHOGUN_REMOTE_STRICT=1`):
@@ -104,6 +117,13 @@ bin/shogun-autoflow --json
 - creates a task
 - sends a delegated message to `karo`
 - does not execute command directly unless `--direct` is used
+
+`bin/shogun-launch` options:
+
+- `--no-autopilot`: 自動稼働を無効化（手動操作のみ）
+- `--agent-interval SEC`: 自動稼働ループの周期
+- `--leader-watch / --no-leader-watch`: 将軍paneの受信早馬表示ON/OFF
+- `--watch`: 旧watchログを `/tmp/shogun-watch-*.log` へ保存
 
 Reset runtime data:
 

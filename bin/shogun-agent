@@ -1,0 +1,657 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import sqlite3
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+TASK_ACTIVE_STATUSES = ("todo", "in_progress", "blocked", "review")
+MESSAGE_MODES = ("teams", "mailbox", "hybrid", "ntfy")
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def now_hms() -> str:
+    return datetime.now().strftime("%H:%M:%S")
+
+
+def narrate(name: str, line: str) -> None:
+    print(f"[{now_hms()}][{name}] {line}", flush=True)
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def parse_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def short(text: str, limit: int = 96) -> str:
+    value = " ".join((text or "").splitlines()).strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
+def parse_created_task_id(output: str) -> int:
+    match = re.search(r"(?:created task:\s*|id[=: ]+)(\d+)", output)
+    if not match:
+        raise RuntimeError(f"failed to parse task id from output: {output!r}")
+    return int(match.group(1))
+
+
+def shogunctl(db: Path, args: list[str], check: bool = True) -> str:
+    cmd = [str(root_dir() / "bin" / "shogunctl"), "--db", str(db), *args]
+    result = run_command(cmd, check=check)
+    return result.stdout.strip()
+
+
+def shogun_comm_send(
+    db: Path,
+    mode: str,
+    sender: str,
+    recipient: str,
+    content: str,
+    task_id: int | None = None,
+    summary: str | None = None,
+) -> None:
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        mode,
+        "--db",
+        str(db),
+        "send",
+        "--from",
+        sender,
+        "--to",
+        recipient,
+        "--content",
+        content,
+    ]
+    if summary:
+        cmd.extend(["--summary", summary])
+    if task_id is not None:
+        cmd.extend(["--task-id", str(task_id)])
+    run_command(cmd, check=True)
+
+
+def shogun_comm_read(db: Path, mode: str, name: str, limit: int) -> list[dict[str, object]]:
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        mode,
+        "--db",
+        str(db),
+        "read",
+        "--name",
+        name,
+        "--unread-only",
+        "--mark-read",
+        "--limit",
+        str(limit),
+        "--json",
+    ]
+    result = run_command(cmd, check=False)
+    if result.returncode != 0:
+        return []
+    out = result.stdout.strip()
+    if not out:
+        return []
+    try:
+        payload = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def set_member_status(db: Path, name: str, status: str) -> None:
+    shogunctl(db, ["member", "set-status", "--name", name, "--status", status], check=True)
+
+
+def task_create(
+    db: Path,
+    actor: str,
+    owner: str,
+    reporter: str,
+    subject: str,
+    description: str,
+    priority: int = 2,
+    parent_id: int | None = None,
+) -> int:
+    cmd = [
+        "task",
+        "create",
+        "--actor",
+        actor,
+        "--owner",
+        owner,
+        "--reporter",
+        reporter,
+        "--priority",
+        str(priority),
+        "--subject",
+        subject,
+        "--description",
+        description,
+    ]
+    if parent_id is not None:
+        cmd.extend(["--parent-id", str(parent_id)])
+    out = shogunctl(db, cmd, check=True)
+    return parse_created_task_id(out)
+
+
+def task_update(
+    db: Path,
+    task_id: int,
+    actor: str,
+    *,
+    status: str | None = None,
+    owner: str | None = None,
+    reviewer: str | None = None,
+    priority: int | None = None,
+    subject: str | None = None,
+    description: str | None = None,
+) -> None:
+    cmd = ["task", "update", "--id", str(task_id), "--actor", actor]
+    if status is not None:
+        cmd.extend(["--status", status])
+    if owner is not None:
+        cmd.extend(["--owner", owner])
+    if reviewer is not None:
+        cmd.extend(["--reviewer", reviewer])
+    if priority is not None:
+        cmd.extend(["--priority", str(priority)])
+    if subject is not None:
+        cmd.extend(["--subject", subject])
+    if description is not None:
+        cmd.extend(["--description", description])
+    shogunctl(db, cmd, check=True)
+
+
+def select_tasks(
+    db: Path,
+    *,
+    owner: str | None = None,
+    statuses: tuple[str, ...] | None = None,
+    owner_like: str | None = None,
+) -> list[dict[str, object]]:
+    query = """
+      SELECT id, subject, description, owner, reporter, reviewer, status, priority, parent_id, updated_at
+      FROM tasks
+      WHERE 1 = 1
+    """
+    params: list[object] = []
+    if owner is not None:
+        query += " AND owner = ?"
+        params.append(owner)
+    if owner_like is not None:
+        query += " AND owner LIKE ?"
+        params.append(owner_like)
+    if statuses:
+        placeholders = ",".join("?" for _ in statuses)
+        query += f" AND status IN ({placeholders})"
+        params.extend(statuses)
+    query += " ORDER BY priority ASC, id ASC"
+    with connect(db) as conn:
+        rows = conn.execute(query, params).fetchall()
+    return [dict(row) for row in rows]
+
+
+def select_children(db: Path, parent_id: int) -> list[dict[str, object]]:
+    with connect(db) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, subject, description, owner, status, priority, updated_at
+            FROM tasks
+            WHERE parent_id = ?
+            ORDER BY id ASC
+            """,
+            (parent_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def worker_names(db: Path) -> list[str]:
+    with connect(db) as conn:
+        rows = conn.execute(
+            "SELECT name FROM members WHERE role = 'worker' ORDER BY name ASC"
+        ).fetchall()
+    return [str(row["name"]) for row in rows]
+
+
+def worker_load(db: Path, name: str) -> int:
+    with connect(db) as conn:
+        row = conn.execute(
+            """
+            SELECT COUNT(*) AS c
+            FROM tasks
+            WHERE owner = ? AND status IN ('todo', 'in_progress', 'blocked', 'review')
+            """,
+            (name,),
+        ).fetchone()
+    return int(row["c"]) if row else 0
+
+
+def choose_worker(db: Path) -> str | None:
+    workers = worker_names(db)
+    if not workers:
+        return None
+    scored = [(worker_load(db, name), name) for name in workers]
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return scored[0][1]
+
+
+def extract_command(text: str) -> str | None:
+    if not text:
+        return None
+    lines = text.splitlines()
+    for idx, raw in enumerate(lines):
+        line = raw.strip()
+        if not line.lower().startswith("command:"):
+            continue
+        inline = line[len("command:") :].strip()
+        if inline:
+            return inline
+        block: list[str] = []
+        for next_line in lines[idx + 1 :]:
+            if next_line.strip() == "":
+                break
+            block.append(next_line)
+        cmd = "\n".join(block).strip()
+        return cmd or None
+    return None
+
+
+def summarize_process_output(stdout: str, stderr: str, max_lines: int = 8) -> str:
+    merged = []
+    if stdout.strip():
+        merged.extend(stdout.strip().splitlines())
+    if stderr.strip():
+        merged.extend(stderr.strip().splitlines())
+    if not merged:
+        return "(no output)"
+    tail = merged[-max_lines:]
+    return "\n".join(tail)
+
+
+def run_shell(command: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str, bool]:
+    try:
+        result = subprocess.run(
+            ["/bin/zsh", "-lc", command],
+            cwd=str(cwd),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            check=False,
+        )
+        return result.returncode, result.stdout or "", result.stderr or "", False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode("utf-8", "ignore") if exc.stdout else "")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode("utf-8", "ignore") if exc.stderr else "")
+        return 124, stdout, stderr, True
+
+
+def make_child_description(parent: dict[str, object], command: str | None) -> str:
+    lines = [
+        f"ParentTask: {parent['id']}",
+        f"ParentSubject: {str(parent['subject'])}",
+        "",
+        "Mission:",
+        (str(parent.get("description") or "") or str(parent["subject"])).strip(),
+    ]
+    if command:
+        lines.extend(["", "command:", command])
+    lines.extend(
+        [
+            "",
+            "完了条件:",
+            "- 実行結果を要約し、status=review に更新すること。",
+            "- ブロッカーがあれば status=blocked とし報告すること。",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def announce_inbox(agent_label: str, messages: list[dict[str, object]]) -> None:
+    for msg in messages:
+        sender = str(msg.get("sender") or "?")
+        content = short(str(msg.get("content") or ""), limit=100)
+        narrate(agent_label, f"早馬着信: {sender}曰く「{content}」")
+
+
+def cycle_karo(args: argparse.Namespace) -> str:
+    label = "家老"
+    messages = shogun_comm_read(args.db, args.mode, args.name, args.inbox_limit)
+    announce_inbox(label, messages)
+
+    parents_todo = select_tasks(args.db, owner=args.name, statuses=("todo",))
+    for parent in parents_todo:
+        chosen = choose_worker(args.db)
+        if not chosen:
+            narrate(label, f"任務 #{parent['id']} は配下不在につき保留。")
+            continue
+        command = extract_command(str(parent.get("description") or ""))
+        child_subject = f"[親#{parent['id']}] {str(parent['subject'])}"
+        child_desc = make_child_description(parent, command)
+        child_id = task_create(
+            args.db,
+            actor=args.name,
+            owner=chosen,
+            reporter=str(parent.get("reporter") or args.name),
+            subject=child_subject,
+            description=child_desc,
+            priority=int(parent.get("priority") or 2),
+            parent_id=int(parent["id"]),
+        )
+        task_update(args.db, int(parent["id"]), args.name, status="in_progress")
+        worker_msg = (
+            f"下知: 任務 #{child_id} を遂行せよ。\n"
+            f"親任務: #{parent['id']} {parent['subject']}\n"
+            f"仕上げたら status=review とし、家老へ報告せよ。"
+        )
+        shogun_msg = (
+            f"上様へ報告。任務 #{parent['id']}「{parent['subject']}」を"
+            f" {chosen} へ割り当て候（子任務 #{child_id}）。"
+        )
+        shogun_comm_send(args.db, args.mode, args.name, chosen, worker_msg, task_id=child_id, summary=f"task {child_id}")
+        shogun_comm_send(args.db, args.mode, args.name, "shogun", shogun_msg, task_id=int(parent["id"]), summary=f"delegated {parent['id']}")
+        narrate(label, f"任務 #{parent['id']} を {chosen} へ下知（子任務 #{child_id}）。")
+
+    parents_active = select_tasks(args.db, owner=args.name, statuses=("in_progress", "blocked"))
+    for parent in parents_active:
+        parent_id = int(parent["id"])
+        children = select_children(args.db, parent_id)
+        if not children:
+            continue
+        child_statuses = {str(child["status"]) for child in children}
+        if child_statuses and child_statuses.issubset({"done"}):
+            if str(parent["status"]) != "done":
+                task_update(args.db, parent_id, args.name, status="done")
+                shogun_comm_send(
+                    args.db,
+                    args.mode,
+                    args.name,
+                    "shogun",
+                    f"上様、任務 #{parent_id}「{parent['subject']}」は全子任務完了につき成就いたしました。",
+                    task_id=parent_id,
+                    summary=f"completed {parent_id}",
+                )
+                narrate(label, f"任務 #{parent_id} を完了報告。")
+            continue
+        if "blocked" in child_statuses:
+            if str(parent["status"]) != "blocked":
+                task_update(args.db, parent_id, args.name, status="blocked")
+                shogun_comm_send(
+                    args.db,
+                    args.mode,
+                    args.name,
+                    "shogun",
+                    f"上様、任務 #{parent_id}「{parent['subject']}」は阻塞あり。指示を乞う。",
+                    task_id=parent_id,
+                    summary=f"blocked {parent_id}",
+                )
+                narrate(label, f"任務 #{parent_id} は阻塞。上申済み。")
+        elif str(parent["status"]) == "blocked":
+            task_update(args.db, parent_id, args.name, status="in_progress")
+            narrate(label, f"任務 #{parent_id} の阻塞が解消。進行へ復帰。")
+
+    still_active = select_tasks(args.db, owner=args.name, statuses=("todo", "in_progress", "blocked"))
+    if any(str(task["status"]) == "blocked" for task in still_active):
+        return "blocked"
+    if still_active:
+        return "working"
+    return "idle"
+
+
+def cycle_ashigaru(args: argparse.Namespace) -> str:
+    label = args.name
+    messages = shogun_comm_read(args.db, args.mode, args.name, args.inbox_limit)
+    announce_inbox(label, messages)
+
+    tasks = select_tasks(args.db, owner=args.name, statuses=("todo", "in_progress", "blocked"))
+    blocked = any(str(task["status"]) == "blocked" for task in tasks)
+    todo_or_progress = [task for task in tasks if str(task["status"]) in {"todo", "in_progress"}]
+
+    for task in todo_or_progress:
+        task_id = int(task["id"])
+        if str(task["status"]) == "todo":
+            task_update(args.db, task_id, args.name, status="in_progress")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "karo",
+                f"家老殿、任務 #{task_id}「{task['subject']}」へ着手つかまつる。",
+                task_id=task_id,
+                summary=f"start {task_id}",
+            )
+            narrate(label, f"任務 #{task_id} に着手。")
+
+        command = extract_command(str(task.get("description") or ""))
+        if command:
+            narrate(label, f"任務 #{task_id} 実行: {short(command, 80)}")
+            code, out, err, timed_out = run_shell(command, args.workdir, args.max_command_sec)
+            summary = summarize_process_output(out, err)
+            if timed_out:
+                task_update(args.db, task_id, args.name, status="blocked")
+                shogun_comm_send(
+                    args.db,
+                    args.mode,
+                    args.name,
+                    "karo",
+                    f"家老殿、任務 #{task_id} は時限超過にて中断。\n{summary}",
+                    task_id=task_id,
+                    summary=f"timeout {task_id}",
+                )
+                narrate(label, f"任務 #{task_id} は時限超過。")
+                continue
+            if code != 0:
+                task_update(args.db, task_id, args.name, status="blocked")
+                shogun_comm_send(
+                    args.db,
+                    args.mode,
+                    args.name,
+                    "karo",
+                    f"家老殿、任務 #{task_id} 失敗（exit={code}）。\n{summary}",
+                    task_id=task_id,
+                    summary=f"failed {task_id}",
+                )
+                narrate(label, f"任務 #{task_id} は失敗（exit={code}）。")
+                continue
+            task_update(args.db, task_id, args.name, status="review")
+            ok_message = (
+                f"家老殿、任務 #{task_id} 仕上げ候。目付殿の検分を願う。\n"
+                f"抜粋:\n{summary}"
+            )
+            shogun_comm_send(args.db, args.mode, args.name, "karo", ok_message, task_id=task_id, summary=f"ready {task_id}")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "metsuke",
+                f"目付殿、任務 #{task_id} の検分を願う。",
+                task_id=task_id,
+                summary=f"review {task_id}",
+            )
+            narrate(label, f"任務 #{task_id} を検分待ちへ送致。")
+        else:
+            task_update(args.db, task_id, args.name, status="review")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "karo",
+                f"家老殿、任務 #{task_id} は手順整理を完了。検分を願う。",
+                task_id=task_id,
+                summary=f"ready {task_id}",
+            )
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "metsuke",
+                f"目付殿、任務 #{task_id} を検分願う。",
+                task_id=task_id,
+                summary=f"review {task_id}",
+            )
+            narrate(label, f"任務 #{task_id} は実行命令なし。検分待ちへ。")
+
+    remaining = select_tasks(args.db, owner=args.name, statuses=("todo", "in_progress", "blocked"))
+    if any(str(task["status"]) == "blocked" for task in remaining):
+        return "blocked"
+    if any(str(task["status"]) in {"todo", "in_progress"} for task in remaining):
+        return "working"
+    return "idle"
+
+
+def needs_rework(task: dict[str, object]) -> bool:
+    merged = f"{task.get('subject', '')}\n{task.get('description', '')}"
+    return bool(re.search(r"(REWORK|要再作業|差戻|\bNG\b)", merged, re.IGNORECASE))
+
+
+def cycle_metsuke(args: argparse.Namespace) -> str:
+    label = "目付"
+    messages = shogun_comm_read(args.db, args.mode, args.name, args.inbox_limit)
+    announce_inbox(label, messages)
+
+    review_tasks = select_tasks(args.db, owner_like="ashigaru%", statuses=("review",))
+    for task in review_tasks:
+        task_id = int(task["id"])
+        owner = str(task.get("owner") or "")
+        if needs_rework(task):
+            task_update(args.db, task_id, args.name, status="in_progress")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                owner,
+                f"{owner}、任務 #{task_id} は差戻し。要件を見直して再提出せよ。",
+                task_id=task_id,
+                summary=f"rework {task_id}",
+            )
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "karo",
+                f"家老殿、任務 #{task_id} は差戻しとした。",
+                task_id=task_id,
+                summary=f"rework {task_id}",
+            )
+            narrate(label, f"任務 #{task_id} を差戻し。")
+            continue
+        task_update(args.db, task_id, args.name, status="done")
+        shogun_comm_send(
+            args.db,
+            args.mode,
+            args.name,
+            "karo",
+            f"家老殿、任務 #{task_id} は検分合格。完了とす。",
+            task_id=task_id,
+            summary=f"passed {task_id}",
+        )
+        if owner:
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                owner,
+                f"{owner}、任務 #{task_id} は検分通過。大儀であった。",
+                task_id=task_id,
+                summary=f"passed {task_id}",
+            )
+        narrate(label, f"任務 #{task_id} を合格。")
+
+    remaining = select_tasks(args.db, owner_like="ashigaru%", statuses=("review",))
+    return "reviewing" if remaining else "idle"
+
+
+def run_cycle(args: argparse.Namespace) -> str:
+    if args.role == "karo":
+        return cycle_karo(args)
+    if args.role == "metsuke":
+        return cycle_metsuke(args)
+    if args.role == "ashigaru":
+        return cycle_ashigaru(args)
+    raise RuntimeError(f"unsupported role: {args.role}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Autonomous worker loop for shogun team members")
+    parser.add_argument("--name", required=True, help="member name (karo/metsuke/ashigaruN)")
+    parser.add_argument("--role", required=True, choices=("karo", "metsuke", "ashigaru"))
+    parser.add_argument("--db", type=parse_path, default=default_db_path())
+    parser.add_argument("--mode", choices=MESSAGE_MODES, default=os.getenv("SHOGUN_COMM_MODE", "teams"))
+    parser.add_argument("--interval-sec", type=float, default=2.0)
+    parser.add_argument("--inbox-limit", type=int, default=100)
+    parser.add_argument("--max-command-sec", type=int, default=180)
+    parser.add_argument("--workdir", type=parse_path, default=root_dir())
+    parser.add_argument("--once", action="store_true")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    status_cache: str | None = None
+    opening = {
+        "karo": "家老、出仕つかまつる。諸隊へ下知を回す。",
+        "metsuke": "目付、検分任務に就く。",
+        "ashigaru": f"{args.name}、出陣。下知を待つ。",
+    }[args.role]
+    narrate(args.name, opening)
+
+    while True:
+        desired = status_cache or "idle"
+        try:
+            desired = run_cycle(args)
+        except Exception as exc:  # pragma: no cover
+            narrate(args.name, f"障り発生: {exc}")
+            desired = "blocked"
+
+        if desired != status_cache:
+            try:
+                set_member_status(args.db, args.name, desired)
+                status_cache = desired
+            except Exception as exc:  # pragma: no cover
+                narrate(args.name, f"状態更新失敗: {exc}")
+
+        if args.once:
+            return 0
+        time.sleep(max(0.2, args.interval_sec))
+
+
+if __name__ == "__main__":
+    sys.exit(main())
