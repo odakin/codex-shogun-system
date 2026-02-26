@@ -15,17 +15,20 @@ FEED_TAIL_EVENTS="${SHOGUN_FEED_TAIL_EVENTS:-0}"
 FEED_TAIL_MESSAGES="${SHOGUN_FEED_TAIL_MESSAGES:-0}"
 FEED_INTERVAL="${SHOGUN_FEED_INTERVAL:-1}"
 FEED_TRUNCATE="${SHOGUN_FEED_TRUNCATE:-0}"
+DRAMA_MODE="${SHOGUN_DRAMA_MODE:-1}"
 
 usage() {
   cat <<'EOF'
 Usage: bin/shogun-launch [--ashigaru N] [--shogun-session NAME] [--multiagent-session NAME] [--comm-mode MODE] [--watch]
                         [--autopilot|--no-autopilot] [--agent-interval SEC]
+                        [--drama|--no-drama]
                         [--leader-watch|--no-leader-watch]
                         [--feed|--no-feed] [--feed-tail-events N] [--feed-tail-messages N]
                         [--feed-interval SEC] [--feed-truncate N]
 
 Environment:
   SHOGUN_AGENT_BOOT_CMD  Optional command executed in each agent pane after setup.
+  SHOGUN_DRAMA_MODE      1 enables samurai/drama chatter (default: 1)
 EOF
 }
 
@@ -62,6 +65,14 @@ while [[ $# -gt 0 ]]; do
     --agent-interval)
       AGENT_INTERVAL="$2"
       shift 2
+      ;;
+    --drama)
+      DRAMA_MODE=1
+      shift
+      ;;
+    --no-drama)
+      DRAMA_MODE=0
+      shift
       ;;
     --leader-watch)
       LEADER_WATCH=1
@@ -132,7 +143,7 @@ if [[ "$LEADER_WATCH" -eq 1 ]]; then
   SHOGUN_WATCH_CMD="bin/shogun-mailbox-watch --name shogun --mode \"$COMM_MODE\" --interval-sec 2 &"
 fi
 tmux send-keys -t "${SHOGUN_SESSION}:0.0" \
-  "cd \"$ROOT_DIR\"; export SHOGUN_NAME=shogun SHOGUN_ROLE=shogun SHOGUN_COMM_MODE=\"$COMM_MODE\"; clear; echo '[将軍] ここは軍議所。委任専任にて動く。'; echo '使い方: bin/shogun-remote run \"<command>\"'; echo \"comm mode: $COMM_MODE\"; bin/shogunctl member set-status --name shogun --status working --session \"$SHOGUN_SESSION\" --pane 0 >/dev/null; ${SHOGUN_WATCH_CMD} echo '[将軍] 下知を待つ。'" C-m
+  "cd \"$ROOT_DIR\"; export SHOGUN_NAME=shogun SHOGUN_ROLE=shogun SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo '[将軍] ここは軍議所。委任専任にて動く。'; echo '使い方: bin/shogun-remote run \"<command>\"'; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name shogun --status working --session \"$SHOGUN_SESSION\" --pane 0 >/dev/null; ${SHOGUN_WATCH_CMD} echo '[将軍] 下知を待つ。'" C-m
 
 if [[ "$SHOW_FEED" -eq 1 ]]; then
   tmux split-window -t "${SHOGUN_SESSION}:0.0" -v -p 45
@@ -166,10 +177,10 @@ for idx in "${!NAMES[@]}"; do
   fi
   if [[ "$AUTOPILOT" -eq 1 ]]; then
     tmux send-keys -t "${MULTIAGENT_SESSION}:0.${pane}" \
-      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\"; clear; echo \"[$name/$role] 出陣準備よし\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi; echo \"[$name/$role] 自動運用を開始する\"; exec bin/shogun-agent --name \"$name\" --role \"$role\" --mode \"$COMM_MODE\" --interval-sec \"$AGENT_INTERVAL\"" C-m
+      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo \"[$name/$role] 出陣準備よし\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi; echo \"[$name/$role] 自動運用を開始する\"; exec bin/shogun-agent --name \"$name\" --role \"$role\" --mode \"$COMM_MODE\" --interval-sec \"$AGENT_INTERVAL\"" C-m
   else
     tmux send-keys -t "${MULTIAGENT_SESSION}:0.${pane}" \
-      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\"; clear; echo \"[$name/$role] ready\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi" C-m
+      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo \"[$name/$role] ready\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi" C-m
   fi
 done
 
@@ -191,6 +202,11 @@ if [[ "$SHOW_FEED" -eq 1 ]]; then
   echo "team feed: enabled (shogun:0.1)"
 else
   echo "team feed: disabled"
+fi
+if [[ "$DRAMA_MODE" -eq 1 ]]; then
+  echo "drama mode: enabled (warrior chatter/persona/rules)"
+else
+  echo "drama mode: disabled"
 fi
 if [[ "$START_WATCHERS" -eq 1 ]]; then
   echo "watchers: enabled (logs in /tmp/shogun-watch-*.log)"

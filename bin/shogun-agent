@@ -14,6 +14,84 @@ from pathlib import Path
 
 TASK_ACTIVE_STATUSES = ("todo", "in_progress", "blocked", "review")
 MESSAGE_MODES = ("teams", "mailbox", "hybrid", "ntfy")
+DEFAULT_DRAMA_MODE = True
+
+PERSONA_RULES: list[tuple[re.Pattern[str], str]] = [
+    (re.compile(r"(readme|doc|document|仕様|文章|説明)"), "軍記テクニカルライター"),
+    (re.compile(r"(research|調査|analy|benchmark|比較)"), "戦場アナリスト"),
+    (re.compile(r"(design|ui|ux|css|layout|画面|見た目)"), "UI意匠奉行"),
+    (re.compile(r"(test|bug|fix|refactor|build|lint|code|実装|修正|テスト)"), "シニアエンジニア"),
+]
+
+WAR_PHRASES: dict[str, tuple[str, ...]] = {
+    "karo_assign": (
+        "電光石火で片を付けよ。",
+        "武功を立て、軍議所へ名を轟かせよ。",
+        "迷えば報告、進めば戦果。",
+    ),
+    "karo_complete": (
+        "軍配はこちらに上がった。",
+        "戦線は安定、次の下知を待つのみ。",
+        "見事な働き、上様へ凱旋報告いたす。",
+    ),
+    "ashigaru_start": (
+        "槍働き、開始いたす。",
+        "駆け込みにて着手つかまつる。",
+        "戦支度よし、いざ実行。",
+    ),
+    "ashigaru_done": (
+        "首尾よく仕上げ候。",
+        "戦果あり、検分を乞う。",
+        "任務成就、次の戦へ備える。",
+    ),
+    "metsuke_pass": (
+        "検分、文句なし。",
+        "品質、軍律ともに合格。",
+        "不備なし、完了を宣す。",
+    ),
+    "metsuke_rework": (
+        "このままでは戦列を乱す。",
+        "規律違反あり、出直しを命ず。",
+        "差戻し。要件を満たして再提出せよ。",
+    ),
+}
+
+
+def env_bool(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip().lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+def stable_index(seed: str, size: int) -> int:
+    if size <= 0:
+        return 0
+    acc = 2166136261
+    for ch in seed:
+        acc ^= ord(ch)
+        acc = (acc * 16777619) & 0xFFFFFFFF
+    return acc % size
+
+
+def war_phrase(kind: str, seed: str) -> str:
+    options = WAR_PHRASES.get(kind, ())
+    if not options:
+        return ""
+    return options[stable_index(f"{kind}:{seed}", len(options))]
+
+
+def choose_persona(subject: str, description: str) -> str:
+    text = f"{subject}\n{description}".lower()
+    for pattern, persona in PERSONA_RULES:
+        if pattern.search(text):
+            return persona
+    return "汎用足軽"
 
 
 def utc_now() -> str:
@@ -349,7 +427,13 @@ def run_shell(command: str, cwd: Path, timeout_sec: int) -> tuple[int, str, str,
         return 124, stdout, stderr, True
 
 
-def make_child_description(parent: dict[str, object], command: str | None) -> str:
+def make_child_description(
+    parent: dict[str, object],
+    command: str | None,
+    *,
+    drama: bool,
+    persona: str,
+) -> str:
     lines = [
         f"ParentTask: {parent['id']}",
         f"ParentSubject: {str(parent['subject'])}",
@@ -367,6 +451,16 @@ def make_child_description(parent: dict[str, object], command: str | None) -> st
             "- ブロッカーがあれば status=blocked とし報告すること。",
         ]
     )
+    if drama:
+        lines.extend(
+            [
+                "",
+                "役回り:",
+                f"- この任務では「{persona}」として遂行せよ。",
+                "- 軍律: 自分の任務のみ実行すること。",
+                "- 越権は『切腹』（比喩: 即再任務）とする。",
+            ]
+        )
     return "\n".join(lines)
 
 
@@ -392,7 +486,8 @@ def cycle_karo(args: argparse.Namespace) -> str:
             continue
         command = extract_command(str(parent.get("description") or ""))
         child_subject = f"[親#{parent['id']}] {str(parent['subject'])}"
-        child_desc = make_child_description(parent, command)
+        persona = choose_persona(str(parent.get("subject") or ""), str(parent.get("description") or ""))
+        child_desc = make_child_description(parent, command, drama=args.drama, persona=persona)
         child_id = task_create(
             args.db,
             actor=args.name,
@@ -404,18 +499,28 @@ def cycle_karo(args: argparse.Namespace) -> str:
             parent_id=int(parent["id"]),
         )
         task_update(args.db, int(parent["id"]), args.name, status="in_progress")
-        worker_msg = (
-            f"下知: 任務 #{child_id} を遂行せよ。\n"
-            f"親任務: #{parent['id']} {parent['subject']}\n"
-            f"仕上げたら status=review とし、家老へ報告せよ。"
-        )
-        shogun_msg = (
-            f"上様へ報告。任務 #{parent['id']}「{parent['subject']}」を"
-            f" {chosen} へ割り当て候（子任務 #{child_id}）。"
-        )
+        rally = war_phrase("karo_assign", f"{parent['id']}:{chosen}:{child_id}")
+        worker_msg_lines = [
+            f"下知: 任務 #{child_id} を遂行せよ。",
+            f"親任務: #{parent['id']} {parent['subject']}",
+            "仕上げたら status=review とし、家老へ報告せよ。",
+        ]
+        if args.drama:
+            worker_msg_lines.insert(2, f"役回り: {persona}")
+            worker_msg_lines.insert(3, "軍律: 自分の任務のみ実行せよ（越権は切腹=再任務）。")
+        if args.drama and rally:
+            worker_msg_lines.append(f"檄: {rally}")
+        worker_msg = "\n".join(worker_msg_lines)
+        shogun_msg_lines = [f"上様へ報告。任務 #{parent['id']}「{parent['subject']}」を {chosen} へ割り当て候（子任務 #{child_id}）。"]
+        if args.drama:
+            shogun_msg_lines.append(f"采配: {chosen} の役回りは「{persona}」。")
+        if args.drama and rally:
+            shogun_msg_lines.append(f"軍議メモ: {rally}")
+        shogun_msg = "\n".join(shogun_msg_lines)
         shogun_comm_send(args.db, args.mode, args.name, chosen, worker_msg, task_id=child_id, summary=f"task {child_id}")
         shogun_comm_send(args.db, args.mode, args.name, "shogun", shogun_msg, task_id=int(parent["id"]), summary=f"delegated {parent['id']}")
-        narrate(label, f"任務 #{parent['id']} を {chosen} へ下知（子任務 #{child_id}）。")
+        extra = f" {rally}" if (args.drama and rally) else ""
+        narrate(label, f"任務 #{parent['id']} を {chosen} へ下知（子任務 #{child_id}）。{extra}".strip())
 
     parents_active = select_tasks(args.db, owner=args.name, statuses=("in_progress", "blocked"))
     for parent in parents_active:
@@ -427,16 +532,20 @@ def cycle_karo(args: argparse.Namespace) -> str:
         if child_statuses and child_statuses.issubset({"done"}):
             if str(parent["status"]) != "done":
                 task_update(args.db, parent_id, args.name, status="done")
+                finish_line = war_phrase("karo_complete", f"{parent_id}:{parent.get('subject','')}")
                 shogun_comm_send(
                     args.db,
                     args.mode,
                     args.name,
                     "shogun",
-                    f"上様、任務 #{parent_id}「{parent['subject']}」は全子任務完了につき成就いたしました。",
+                    (
+                        f"上様、任務 #{parent_id}「{parent['subject']}」は全子任務完了につき成就いたしました。"
+                        + (f"\n戦況: {finish_line}" if (args.drama and finish_line) else "")
+                    ),
                     task_id=parent_id,
                     summary=f"completed {parent_id}",
                 )
-                narrate(label, f"任務 #{parent_id} を完了報告。")
+                narrate(label, f"任務 #{parent_id} を完了報告。{finish_line if (args.drama and finish_line) else ''}".strip())
             continue
         if "blocked" in child_statuses:
             if str(parent["status"]) != "blocked":
@@ -476,16 +585,20 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
         task_id = int(task["id"])
         if str(task["status"]) == "todo":
             task_update(args.db, task_id, args.name, status="in_progress")
+            start_phrase = war_phrase("ashigaru_start", f"{args.name}:{task_id}")
             shogun_comm_send(
                 args.db,
                 args.mode,
                 args.name,
                 "karo",
-                f"家老殿、任務 #{task_id}「{task['subject']}」へ着手つかまつる。",
+                (
+                    f"家老殿、任務 #{task_id}「{task['subject']}」へ着手つかまつる。"
+                    + (f"\n檄応答: {start_phrase}" if (args.drama and start_phrase) else "")
+                ),
                 task_id=task_id,
                 summary=f"start {task_id}",
             )
-            narrate(label, f"任務 #{task_id} に着手。")
+            narrate(label, f"任務 #{task_id} に着手。{start_phrase if (args.drama and start_phrase) else ''}".strip())
 
         command = extract_command(str(task.get("description") or ""))
         if command:
@@ -499,7 +612,11 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     args.mode,
                     args.name,
                     "karo",
-                    f"家老殿、任務 #{task_id} は時限超過にて中断。\n実行ログ:\n{execution_log}",
+                    (
+                        f"家老殿、任務 #{task_id} は時限超過にて中断。"
+                        + ("\n軍律上、即時の追加下知を請う。" if args.drama else "")
+                        + f"\n実行ログ:\n{execution_log}"
+                    ),
                     task_id=task_id,
                     summary=f"timeout {task_id}",
                 )
@@ -512,16 +629,22 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     args.mode,
                     args.name,
                     "karo",
-                    f"家老殿、任務 #{task_id} 失敗（exit={code}）。\n実行ログ:\n{execution_log}",
+                    (
+                        f"家老殿、任務 #{task_id} 失敗（exit={code}）。"
+                        + ("\n申し開き: 原因究明のうえ再戦を願う。" if args.drama else "")
+                        + f"\n実行ログ:\n{execution_log}"
+                    ),
                     task_id=task_id,
                     summary=f"failed {task_id}",
                 )
                 narrate(label, f"任務 #{task_id} は失敗（exit={code}）。")
                 continue
             task_update(args.db, task_id, args.name, status="review")
+            done_phrase = war_phrase("ashigaru_done", f"{args.name}:{task_id}")
             ok_message = (
                 f"家老殿、任務 #{task_id} 仕上げ候。目付殿の検分を願う。\n"
-                f"実行ログ:\n{execution_log}"
+                + (f"戦果: {done_phrase}\n" if (args.drama and done_phrase) else "")
+                + f"実行ログ:\n{execution_log}"
             )
             shogun_comm_send(args.db, args.mode, args.name, "karo", ok_message, task_id=task_id, summary=f"ready {task_id}")
             shogun_comm_send(
@@ -533,7 +656,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                 task_id=task_id,
                 summary=f"review {task_id}",
             )
-            narrate(label, f"任務 #{task_id} を検分待ちへ送致。")
+            narrate(label, f"任務 #{task_id} を検分待ちへ送致。{done_phrase if (args.drama and done_phrase) else ''}".strip())
         else:
             task_update(args.db, task_id, args.name, status="review")
             shogun_comm_send(
@@ -566,7 +689,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
 
 def needs_rework(task: dict[str, object]) -> bool:
     merged = f"{task.get('subject', '')}\n{task.get('description', '')}"
-    return bool(re.search(r"(REWORK|要再作業|差戻|\bNG\b)", merged, re.IGNORECASE))
+    return bool(re.search(r"(REWORK|要再作業|\bNG\b)", merged, re.IGNORECASE))
 
 
 def cycle_metsuke(args: argparse.Namespace) -> str:
@@ -579,13 +702,17 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
         task_id = int(task["id"])
         owner = str(task.get("owner") or "")
         if needs_rework(task):
+            rework_line = war_phrase("metsuke_rework", f"{task_id}:{owner}")
             task_update(args.db, task_id, args.name, status="in_progress")
             shogun_comm_send(
                 args.db,
                 args.mode,
                 args.name,
                 owner,
-                f"{owner}、任務 #{task_id} は差戻し。要件を見直して再提出せよ。",
+                (
+                    f"{owner}、任務 #{task_id} は差戻し。要件を見直して再提出せよ。"
+                    + (f"\n軍律: {rework_line}" if (args.drama and rework_line) else "")
+                ),
                 task_id=task_id,
                 summary=f"rework {task_id}",
             )
@@ -594,19 +721,26 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
                 args.mode,
                 args.name,
                 "karo",
-                f"家老殿、任務 #{task_id} は差戻しとした。",
+                (
+                    f"家老殿、任務 #{task_id} は差戻しとした。"
+                    + (f"\n検分記録: {rework_line}" if (args.drama and rework_line) else "")
+                ),
                 task_id=task_id,
                 summary=f"rework {task_id}",
             )
-            narrate(label, f"任務 #{task_id} を差戻し。")
+            narrate(label, f"任務 #{task_id} を差戻し。{rework_line if (args.drama and rework_line) else ''}".strip())
             continue
+        pass_line = war_phrase("metsuke_pass", f"{task_id}:{owner}")
         task_update(args.db, task_id, args.name, status="done")
         shogun_comm_send(
             args.db,
             args.mode,
             args.name,
             "karo",
-            f"家老殿、任務 #{task_id} は検分合格。完了とす。",
+            (
+                f"家老殿、任務 #{task_id} は検分合格。完了とす。"
+                + (f"\n検分記録: {pass_line}" if (args.drama and pass_line) else "")
+            ),
             task_id=task_id,
             summary=f"passed {task_id}",
         )
@@ -616,11 +750,14 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
                 args.mode,
                 args.name,
                 owner,
-                f"{owner}、任務 #{task_id} は検分通過。大儀であった。",
+                (
+                    f"{owner}、任務 #{task_id} は検分通過。大儀であった。"
+                    + (f"\n評: {pass_line}" if (args.drama and pass_line) else "")
+                ),
                 task_id=task_id,
                 summary=f"passed {task_id}",
             )
-        narrate(label, f"任務 #{task_id} を合格。")
+        narrate(label, f"任務 #{task_id} を合格。{pass_line if (args.drama and pass_line) else ''}".strip())
 
     remaining = select_tasks(args.db, owner_like="ashigaru%", statuses=("review",))
     return "reviewing" if remaining else "idle"
@@ -651,6 +788,10 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.getenv("SHOGUN_AGENT_OUTPUT_MAX_CHARS", "4000")),
         help="0 means no truncation",
     )
+    parser.set_defaults(drama=env_bool("SHOGUN_DRAMA_MODE", DEFAULT_DRAMA_MODE))
+    drama_group = parser.add_mutually_exclusive_group()
+    drama_group.add_argument("--drama", dest="drama", action="store_true", help="Enable dramatic samurai chatter")
+    drama_group.add_argument("--no-drama", dest="drama", action="store_false", help="Disable dramatic chatter")
     parser.add_argument("--workdir", type=parse_path, default=root_dir())
     parser.add_argument("--once", action="store_true")
     return parser
@@ -660,11 +801,18 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
     status_cache: str | None = None
-    opening = {
-        "karo": "家老、出仕つかまつる。諸隊へ下知を回す。",
-        "metsuke": "目付、検分任務に就く。",
-        "ashigaru": f"{args.name}、出陣。下知を待つ。",
-    }[args.role]
+    if args.drama:
+        opening = {
+            "karo": "家老、出仕つかまつる。軍律を掲げ、諸隊へ下知を回す。",
+            "metsuke": "目付、検分任務に就く。軍律違反は切腹（比喩: 差戻し）と心得よ。",
+            "ashigaru": f"{args.name}、出陣。武功を立てん。",
+        }[args.role]
+    else:
+        opening = {
+            "karo": "家老、出仕つかまつる。諸隊へ下知を回す。",
+            "metsuke": "目付、検分任務に就く。",
+            "ashigaru": f"{args.name}、出陣。下知を待つ。",
+        }[args.role]
     narrate(args.name, opening)
 
     while True:

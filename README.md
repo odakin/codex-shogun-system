@@ -16,6 +16,7 @@ Codex向けに実装した、戦国風マルチエージェント運用基盤で
   - `ashigaru*`: 実行とレビュー送致
   - `metsuke`: 検分（review -> done）
 - 将軍画面への早馬ストリーム表示（将軍調ログ）
+- 演出モード（`drama`）: 役回り自動付与、軍律（越権=再任務）、戦国調の檄と戦況報告
 - 通信方式の切替:
   - `teams`（共有メッセージング）
   - `sendkeys`（Gen1）
@@ -48,6 +49,7 @@ bin/shogun-launch --ashigaru 10 --comm-mode teams
 - `leader-watch=ON`（将軍paneで受信早馬を表示）
 - `feed=ON`（将軍ウィンドウで全隊の task/message を常時表示）
   - `feed-truncate=0`（要約せず全文表示）
+- `drama=ON`（戦国演出ログ・役回り自動付与）
 - 直前の task/message/event をクリアしてから起動
 
 Attach:
@@ -124,6 +126,7 @@ bin/shogun-agent --name karo --role karo --mode teams --once
 
 - `--no-autopilot`: 自動稼働を無効化（手動操作のみ）
 - `--agent-interval SEC`: 自動稼働ループの周期
+- `--drama / --no-drama`: 戦国演出モードON/OFF（既定ON）
 - `--leader-watch / --no-leader-watch`: 将軍paneの受信早馬表示ON/OFF
 - `--feed / --no-feed`: 将軍ウィンドウの全隊フィード表示ON/OFF
 - `--feed-tail-events N --feed-tail-messages N --feed-interval SEC`: フィード表示調整（`N=0` は全件）
@@ -133,6 +136,7 @@ bin/shogun-agent --name karo --role karo --mode teams --once
 `bin/shogun-agent` options:
 
 - `--output-max-chars N`: 実行ログをメッセージに含める最大文字数（`0` は無制限）
+- `--drama / --no-drama`: 役回り・檄・軍律メッセージの演出ON/OFF（`SHOGUN_DRAMA_MODE` でも指定可）
 
 Reset runtime data:
 
