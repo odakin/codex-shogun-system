@@ -125,7 +125,7 @@ bin/shogun-agent --name karo --role karo --mode teams --once
 - `--agent-interval SEC`: 自動稼働ループの周期
 - `--leader-watch / --no-leader-watch`: 将軍paneの受信早馬表示ON/OFF
 - `--feed / --no-feed`: 将軍ウィンドウの全隊フィード表示ON/OFF
-- `--feed-tail-events N --feed-tail-messages N --feed-interval SEC`: フィード表示調整
+- `--feed-tail-events N --feed-tail-messages N --feed-interval SEC`: フィード表示調整（`N=0` は全件）
 - `--watch`: 旧watchログを `/tmp/shogun-watch-*.log` へ保存
 
 Reset runtime data:

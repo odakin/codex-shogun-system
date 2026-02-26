@@ -42,4 +42,4 @@
 
 - `bin/shogunctl status` はメンバー/タスク集計に加えて最近の `task_events` と `messages` を表示。
 - `bin/shogun-launch` 既定では将軍paneで早馬ストリームを表示し、multiagent paneで各役職が将軍調ログを出力する。
-- `bin/shogun-launch` 既定では `shogun:0.1` に `bin/shogun-feed` を起動し、全隊のイベント/メッセージを常時表示する。
+- `bin/shogun-launch` 既定では `shogun:0.1` に `bin/shogun-feed` を起動し、全隊のイベント/メッセージを全件表示 + 常時追尾する。

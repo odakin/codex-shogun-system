@@ -37,7 +37,22 @@ def preview(text: object, limit: int = 96) -> str:
 
 def fetch_tail_events(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
     if n <= 0:
-        return []
+        rows = conn.execute(
+            """
+            SELECT
+              e.id,
+              e.task_id,
+              COALESCE(t.subject, '') AS subject,
+              e.actor,
+              e.event_type,
+              COALESCE(e.detail, '') AS detail,
+              e.created_at
+            FROM task_events e
+            LEFT JOIN tasks t ON t.id = e.task_id
+            ORDER BY e.id ASC
+            """
+        ).fetchall()
+        return list(rows)
     rows = conn.execute(
         """
         SELECT
@@ -60,7 +75,14 @@ def fetch_tail_events(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
 
 def fetch_tail_messages(conn: sqlite3.Connection, n: int) -> list[sqlite3.Row]:
     if n <= 0:
-        return []
+        rows = conn.execute(
+            """
+            SELECT id, sender, recipient, kind, task_id, created_at, content
+            FROM messages
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        return list(rows)
     rows = conn.execute(
         """
         SELECT id, sender, recipient, kind, task_id, created_at, content
@@ -169,8 +191,8 @@ def run(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Live feed of shogun task events/messages")
     parser.add_argument("--db", type=parse_path, default=default_db_path())
-    parser.add_argument("--tail-events", type=int, default=18)
-    parser.add_argument("--tail-messages", type=int, default=24)
+    parser.add_argument("--tail-events", type=int, default=0, help="0 means all events")
+    parser.add_argument("--tail-messages", type=int, default=0, help="0 means all messages")
     parser.add_argument("--no-tail", action="store_true")
     parser.add_argument("--interval-sec", type=float, default=1.0)
     parser.add_argument("--batch-limit", type=int, default=200)
@@ -191,4 +213,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
