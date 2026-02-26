@@ -11,6 +11,8 @@
 | タスク割当 | `bin/shogunctl task update --id N --actor A --owner B` |
 | タスク完了 | `bin/shogunctl task update --id N --actor A --status done` |
 | 受信箱確認 | `bin/shogun-comm --mode <mode> read --name A --unread-only --mark-read` |
+| 将軍経由で委任 | `bin/shogun-remote run "..."`（strict default: task+message作成） |
+| 直実行（例外） | `bin/shogun-remote run --direct "..."` |
 
 ## 互換API (Agent Teams風)
 
@@ -33,3 +35,6 @@
 - `metsuke`: レビュー品質ゲート
 - `ashigaru*`: 実行担当
 
+## 監視表示
+
+- `bin/shogunctl status` はメンバー/タスク集計に加えて最近の `task_events` と `messages` を表示。

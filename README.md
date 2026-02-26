@@ -90,10 +90,20 @@ bin/shogun-api call TaskList owner=karo status=todo
 
 ```bash
 bin/shogunctl status
+bin/shogunctl status --recent-events 20 --recent-messages 40
+bin/shogun-remote status
+bin/shogun-remote run "pnpm test"                  # strict delegate (default)
+bin/shogun-remote run --direct "bin/shogunctl status"  # direct run (bypass strict)
 bin/shogun-watch 5
 bin/shogun-watchdog --task-timeout-min 10 --member-timeout-min 10 --dry-run
 bin/shogun-autoflow --json
 ```
+
+`bin/shogun-remote run` is strict by default (`SHOGUN_REMOTE_STRICT=1`):
+
+- creates a task
+- sends a delegated message to `karo`
+- does not execute command directly unless `--direct` is used
 
 Reset runtime data:
 
@@ -115,4 +125,3 @@ bin/shogunctl reset
 - `instructions/`: role definitions
 - `state/`: runtime state (DB/mailboxes/spool; mostly ignored from git)
 - `CLAUDE.md`: protocol and role constraints
-

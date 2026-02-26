@@ -1,0 +1,304 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+TARGET="${SHOGUN_TMUX_TARGET:-shogun:0.0}"
+DEFAULT_LINES="${SHOGUN_REMOTE_LINES:-60}"
+DEFAULT_WAIT="${SHOGUN_REMOTE_WAIT:-0.4}"
+DEFAULT_STRICT="${SHOGUN_REMOTE_STRICT:-1}"
+DEFAULT_COMM_MODE="${SHOGUN_REMOTE_COMM_MODE:-${SHOGUN_COMM_MODE:-teams}}"
+DEFAULT_SENDER="${SHOGUN_REMOTE_SENDER:-shogun}"
+DEFAULT_OWNER="${SHOGUN_REMOTE_OWNER:-karo}"
+DEFAULT_RECIPIENT="${SHOGUN_REMOTE_RECIPIENT:-karo}"
+DEFAULT_PRIORITY="${SHOGUN_REMOTE_PRIORITY:-2}"
+
+usage() {
+  cat <<'EOF'
+Remote control helper for the shogun tmux pane.
+
+Usage:
+  bin/shogun-remote [--target SESSION:WINDOW.PANE] <command> [args...]
+
+Commands:
+  status
+      Print tmux sessions and pane metadata.
+  send <text>
+      Send raw text to pane (without Enter).
+  enter
+      Send Enter.
+  run [--wait SEC] [--lines N] [--no-capture] <shell command...>
+      Strict delegate mode (default): create Task + send Message to karo.
+      Use --direct to bypass and run command in pane.
+      Options:
+        --direct
+        --delegate
+        --strict 0|1
+        --sender NAME --owner NAME --recipient NAME
+        --priority N --comm-mode MODE
+        --subject TEXT --description TEXT
+  capture [--lines N]
+      Print pane output tail.
+  interrupt
+      Send Ctrl-C.
+  clear
+      Send Ctrl-L.
+
+Examples:
+  bin/shogun-remote status
+  bin/shogun-remote run "bin/shogunctl status"
+  bin/shogun-remote run --direct "bin/shogunctl status"
+  bin/shogun-remote run --subject "実装依頼" "pnpm run test"
+  bin/shogun-remote send "echo hello"; bin/shogun-remote enter
+  bin/shogun-remote capture --lines 80
+EOF
+}
+
+require_tmux() {
+  if ! command -v tmux >/dev/null 2>&1; then
+    echo "error: tmux is required" >&2
+    exit 1
+  fi
+}
+
+capture_tail() {
+  local lines="$1"
+  tmux capture-pane -t "$TARGET" -p | tail -n "$lines"
+}
+
+create_delegated_task() {
+  local run_cmd="$1"
+  local sender="$2"
+  local owner="$3"
+  local recipient="$4"
+  local priority="$5"
+  local comm_mode="$6"
+  local subject="$7"
+  local description="$8"
+
+  local task_output task_id msg_content
+  task_output="$("$ROOT_DIR/bin/shogunctl" task create \
+    --actor "$sender" \
+    --owner "$owner" \
+    --reporter "$sender" \
+    --priority "$priority" \
+    --subject "$subject" \
+    --description "$description")"
+  task_id="$(
+    printf '%s\n' "$task_output" \
+      | sed -nE \
+          -e 's/.*id[=:[:space:]]+([0-9]+).*/\1/p' \
+          -e 's/.*created task:[[:space:]]*([0-9]+).*/\1/p' \
+      | tail -n 1
+  )"
+  if [[ -z "$task_id" ]]; then
+    echo "error: failed to parse task id from: $task_output" >&2
+    exit 1
+  fi
+
+  msg_content=$(
+    cat <<EOF
+Task #$task_id を委任する。
+command:
+$run_cmd
+
+完了後は task update で status=done とし、将軍へ報告せよ。
+EOF
+  )
+
+  "$ROOT_DIR/bin/shogun-comm" \
+    --mode "$comm_mode" \
+    send \
+    --from "$sender" \
+    --to "$recipient" \
+    --task-id "$task_id" \
+    --summary "delegated command #$task_id" \
+    --content "$msg_content" >/dev/null
+
+  echo "delegated task created: id=$task_id owner=$owner recipient=$recipient comm_mode=$comm_mode"
+  echo "subject: $subject"
+}
+
+require_tmux
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --target)
+      TARGET="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+
+if [[ $# -lt 1 ]]; then
+  usage
+  exit 1
+fi
+
+cmd="$1"
+shift
+
+case "$cmd" in
+  status)
+    session="${TARGET%%:*}"
+    echo "target: $TARGET"
+    echo
+    tmux list-sessions
+    echo
+    tmux list-windows -t "$session"
+    echo
+    tmux list-panes -t "$TARGET" -F 'pane=#{pane_index} active=#{pane_active} title=#{pane_title} pid=#{pane_pid}'
+    ;;
+  send)
+    if [[ $# -lt 1 ]]; then
+      echo "error: send requires text" >&2
+      exit 1
+    fi
+    text="$*"
+    tmux send-keys -t "$TARGET" "$text"
+    ;;
+  enter)
+    tmux send-keys -t "$TARGET" C-m
+    ;;
+  run)
+    wait_sec="$DEFAULT_WAIT"
+    lines="$DEFAULT_LINES"
+    do_capture=1
+    strict_mode="$DEFAULT_STRICT"
+    force_direct=0
+    force_delegate=0
+    sender="$DEFAULT_SENDER"
+    owner="$DEFAULT_OWNER"
+    recipient="$DEFAULT_RECIPIENT"
+    priority="$DEFAULT_PRIORITY"
+    comm_mode="$DEFAULT_COMM_MODE"
+    subject=""
+    description=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --wait)
+          wait_sec="$2"
+          shift 2
+          ;;
+        --lines)
+          lines="$2"
+          shift 2
+          ;;
+        --no-capture)
+          do_capture=0
+          shift
+          ;;
+        --direct|--force-direct)
+          force_direct=1
+          shift
+          ;;
+        --delegate)
+          force_delegate=1
+          shift
+          ;;
+        --strict)
+          strict_mode="$2"
+          shift 2
+          ;;
+        --sender)
+          sender="$2"
+          shift 2
+          ;;
+        --owner)
+          owner="$2"
+          shift 2
+          ;;
+        --recipient)
+          recipient="$2"
+          shift 2
+          ;;
+        --priority)
+          priority="$2"
+          shift 2
+          ;;
+        --comm-mode)
+          comm_mode="$2"
+          shift 2
+          ;;
+        --subject)
+          subject="$2"
+          shift 2
+          ;;
+        --description)
+          description="$2"
+          shift 2
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+    if [[ $# -lt 1 ]]; then
+      echo "error: run requires a shell command" >&2
+      exit 1
+    fi
+    run_cmd="$*"
+
+    if [[ "$force_direct" -eq 0 ]] && ([[ "$strict_mode" != "0" ]] || [[ "$force_delegate" -eq 1 ]]); then
+      if [[ -z "$subject" ]]; then
+        one_line_cmd="$(printf '%s' "$run_cmd" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+        if [[ ${#one_line_cmd} -gt 72 ]]; then
+          one_line_cmd="${one_line_cmd:0:69}..."
+        fi
+        subject="Delegate command: $one_line_cmd"
+      fi
+      if [[ -z "$description" ]]; then
+        description=$(
+          cat <<EOF
+Delegated by shogun-remote strict mode.
+
+command:
+$run_cmd
+EOF
+        )
+      fi
+      create_delegated_task "$run_cmd" "$sender" "$owner" "$recipient" "$priority" "$comm_mode" "$subject" "$description"
+      exit 0
+    fi
+
+    tmux send-keys -t "$TARGET" "$run_cmd"
+    tmux send-keys -t "$TARGET" C-m
+    sleep "$wait_sec"
+    if [[ "$do_capture" -eq 1 ]]; then
+      capture_tail "$lines"
+    fi
+    ;;
+  capture)
+    lines="$DEFAULT_LINES"
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --lines)
+          lines="$2"
+          shift 2
+          ;;
+        *)
+          echo "error: unknown capture option '$1'" >&2
+          exit 1
+          ;;
+      esac
+    done
+    capture_tail "$lines"
+    ;;
+  interrupt)
+    tmux send-keys -t "$TARGET" C-c
+    ;;
+  clear)
+    tmux send-keys -t "$TARGET" C-l
+    ;;
+  *)
+    echo "error: unknown command '$cmd'" >&2
+    usage
+    exit 1
+    ;;
+esac

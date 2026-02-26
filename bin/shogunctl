@@ -134,6 +134,14 @@ def format_rows(rows: list[sqlite3.Row], columns: list[str]) -> str:
     return "\n".join(lines)
 
 
+def preview_text(text: object, limit: int = 96) -> str:
+    value = "" if text is None else str(text)
+    value = " ".join(value.splitlines()).strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 3] + "..."
+
+
 def is_ashigaru(name: str | None) -> bool:
     return bool(name) and name.startswith("ashigaru")
 
@@ -475,6 +483,66 @@ def cmd_status(args: argparse.Namespace) -> int:
         broadcast_unread = conn.execute(
             "SELECT COUNT(*) AS unread FROM messages WHERE read_at IS NULL AND recipient = '*'"
         ).fetchone()
+        recent_task_events_raw = conn.execute(
+            """
+            SELECT
+              e.id,
+              e.task_id,
+              COALESCE(t.subject, '') AS subject,
+              e.actor,
+              e.event_type,
+              COALESCE(e.detail, '') AS detail,
+              e.created_at
+            FROM task_events e
+            LEFT JOIN tasks t ON t.id = e.task_id
+            ORDER BY e.id DESC
+            LIMIT ?
+            """,
+            (args.recent_events,),
+        ).fetchall()
+        recent_messages_raw = conn.execute(
+            """
+            SELECT
+              id,
+              sender,
+              recipient,
+              kind,
+              task_id,
+              created_at,
+              read_at,
+              content
+            FROM messages
+            ORDER BY id DESC
+            LIMIT ?
+            """,
+            (args.recent_messages,),
+        ).fetchall()
+
+    recent_task_events = [
+        {
+            "id": row["id"],
+            "task_id": row["task_id"],
+            "actor": row["actor"],
+            "event_type": row["event_type"],
+            "created_at": row["created_at"],
+            "subject": preview_text(row["subject"], limit=42),
+            "detail": preview_text(row["detail"], limit=60),
+        }
+        for row in recent_task_events_raw
+    ]
+    recent_messages = [
+        {
+            "id": row["id"],
+            "sender": row["sender"],
+            "recipient": row["recipient"],
+            "kind": row["kind"],
+            "task_id": row["task_id"],
+            "created_at": row["created_at"],
+            "read_at": row["read_at"] or "",
+            "content": preview_text(row["content"], limit=70),
+        }
+        for row in recent_messages_raw
+    ]
 
     print("== Members ==")
     print(format_rows(members, ["name", "role", "status", "session", "pane"]))
@@ -486,6 +554,22 @@ def cmd_status(args: argparse.Namespace) -> int:
     print(format_rows(inbox_summary, ["name", "unread"]))
     print()
     print(f"unread broadcast messages: {broadcast_unread['unread']}")
+    print()
+    print(f"== Recent Task Events (last {args.recent_events}) ==")
+    print(
+        format_rows(
+            recent_task_events,
+            ["id", "task_id", "actor", "event_type", "created_at", "subject", "detail"],
+        )
+    )
+    print()
+    print(f"== Recent Messages (last {args.recent_messages}) ==")
+    print(
+        format_rows(
+            recent_messages,
+            ["id", "sender", "recipient", "kind", "task_id", "created_at", "read_at", "content"],
+        )
+    )
     return 0
 
 
@@ -664,6 +748,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_msg_inbox.set_defaults(func=cmd_message_inbox)
 
     p_status = sub.add_parser("status", help="Show dashboard summary")
+    p_status.add_argument("--recent-events", type=int, default=12)
+    p_status.add_argument("--recent-messages", type=int, default=20)
     p_status.set_defaults(func=cmd_status)
 
     p_agent_sync = sub.add_parser("agent-sync", help="Output assigned tasks + unread messages as JSON")
