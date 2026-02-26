@@ -250,34 +250,49 @@ def select_children(db: Path, parent_id: int) -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
-def worker_names(db: Path) -> list[str]:
+def worker_stats(db: Path) -> list[tuple[str, int, str | None]]:
     with connect(db) as conn:
         rows = conn.execute(
-            "SELECT name FROM members WHERE role = 'worker' ORDER BY name ASC"
-        ).fetchall()
-    return [str(row["name"]) for row in rows]
-
-
-def worker_load(db: Path, name: str) -> int:
-    with connect(db) as conn:
-        row = conn.execute(
             """
-            SELECT COUNT(*) AS c
-            FROM tasks
-            WHERE owner = ? AND status IN ('todo', 'in_progress', 'blocked', 'review')
+            SELECT
+              m.name AS name,
+              COALESCE(SUM(CASE WHEN t.status IN ('todo', 'in_progress', 'blocked', 'review') THEN 1 ELSE 0 END), 0) AS active_load,
+              MAX(t.created_at) AS last_assigned_at
+            FROM members m
+            LEFT JOIN tasks t ON t.owner = m.name
+            WHERE m.role = 'worker'
+            GROUP BY m.name
+            ORDER BY m.name ASC
             """,
-            (name,),
-        ).fetchone()
-    return int(row["c"]) if row else 0
+        ).fetchall()
+    return [
+        (
+            str(row["name"]),
+            int(row["active_load"]),
+            str(row["last_assigned_at"]) if row["last_assigned_at"] is not None else None,
+        )
+        for row in rows
+    ]
 
 
 def choose_worker(db: Path) -> str | None:
-    workers = worker_names(db)
-    if not workers:
+    stats = worker_stats(db)
+    if not stats:
         return None
-    scored = [(worker_load(db, name), name) for name in workers]
-    scored.sort(key=lambda x: (x[0], x[1]))
-    return scored[0][1]
+    # 1) active_load が小さい順
+    # 2) 一度も割当が無い worker を優先
+    # 3) 最終割当が古い順（実質ラウンドロビン）
+    # 4) name で安定化
+    ranked = sorted(
+        stats,
+        key=lambda x: (
+            x[1],
+            0 if x[2] is None else 1,
+            x[2] or "",
+            x[0],
+        ),
+    )
+    return ranked[0][0]
 
 
 def extract_command(text: str) -> str | None:
