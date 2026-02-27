@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ASHIGARU_COUNT=10
+ASHIGARU_COUNT=7
 SHOGUN_SESSION="shogun"
 MULTIAGENT_SESSION="multiagent"
 COMM_MODE="${SHOGUN_COMM_MODE:-teams}"
@@ -16,11 +16,28 @@ FEED_TAIL_MESSAGES="${SHOGUN_FEED_TAIL_MESSAGES:-0}"
 FEED_INTERVAL="${SHOGUN_FEED_INTERVAL:-1}"
 FEED_TRUNCATE="${SHOGUN_FEED_TRUNCATE:-0}"
 DRAMA_MODE="${SHOGUN_DRAMA_MODE:-1}"
+SKILL_AUTOPILOT="${SHOGUN_SKILL_AUTOPILOT:-1}"
+SKILL_INTERVAL_SEC="${SHOGUN_SKILL_INTERVAL_SEC:-30}"
+SKILL_MIN_COUNT="${SHOGUN_SKILL_MIN_COUNT:-3}"
+SKILL_SENDER="${SHOGUN_SKILL_SENDER:-skillsmith}"
+KARO_DECOMPOSE_MODE="${SHOGUN_KARO_DECOMPOSE_MODE:-auto}"
+ASHIGARU_EXEC_MODE="${SHOGUN_ASHIGARU_EXEC_MODE:-auto}"
+KARO_CODEX_BIN="${SHOGUN_KARO_CODEX_BIN:-codex}"
+ASHIGARU_CODEX_BIN="${SHOGUN_ASHIGARU_CODEX_BIN:-codex}"
+DIALOGUE_MODE="${SHOGUN_DIALOGUE_MODE:-auto}"
+DIALOGUE_CODEX_BIN="${SHOGUN_DIALOGUE_CODEX_BIN:-codex}"
+SAMURAI_TONE="${SHOGUN_SAMURAI_TONE:-strong}"
+ASHIGARU_ACK_WAIT_SEC="${SHOGUN_ASHIGARU_ACK_WAIT_SEC:-8}"
+ASHIGARU_PROGRESS_INTERVAL_SEC="${SHOGUN_ASHIGARU_PROGRESS_INTERVAL_SEC:-10}"
 
 usage() {
   cat <<'EOF'
 Usage: bin/shogun-launch [--ashigaru N] [--shogun-session NAME] [--multiagent-session NAME] [--comm-mode MODE] [--watch]
                         [--autopilot|--no-autopilot] [--agent-interval SEC]
+                        [--skills|--no-skills] [--skill-interval-sec SEC] [--skill-min-count N] [--skill-sender NAME]
+                        [--karo-decompose-mode MODE] [--ashigaru-exec-mode MODE]
+                        [--dialogue-mode MODE] [--samurai-tone LEVEL]
+                        [--ashigaru-ack-wait-sec SEC] [--ashigaru-progress-interval-sec SEC]
                         [--drama|--no-drama]
                         [--leader-watch|--no-leader-watch]
                         [--feed|--no-feed] [--feed-tail-events N] [--feed-tail-messages N]
@@ -64,6 +81,50 @@ while [[ $# -gt 0 ]]; do
       ;;
     --agent-interval)
       AGENT_INTERVAL="$2"
+      shift 2
+      ;;
+    --skills)
+      SKILL_AUTOPILOT=1
+      shift
+      ;;
+    --no-skills)
+      SKILL_AUTOPILOT=0
+      shift
+      ;;
+    --skill-interval-sec)
+      SKILL_INTERVAL_SEC="$2"
+      shift 2
+      ;;
+    --skill-min-count)
+      SKILL_MIN_COUNT="$2"
+      shift 2
+      ;;
+    --skill-sender)
+      SKILL_SENDER="$2"
+      shift 2
+      ;;
+    --karo-decompose-mode)
+      KARO_DECOMPOSE_MODE="$2"
+      shift 2
+      ;;
+    --ashigaru-exec-mode)
+      ASHIGARU_EXEC_MODE="$2"
+      shift 2
+      ;;
+    --dialogue-mode)
+      DIALOGUE_MODE="$2"
+      shift 2
+      ;;
+    --samurai-tone)
+      SAMURAI_TONE="$2"
+      shift 2
+      ;;
+    --ashigaru-ack-wait-sec)
+      ASHIGARU_ACK_WAIT_SEC="$2"
+      shift 2
+      ;;
+    --ashigaru-progress-interval-sec)
+      ASHIGARU_PROGRESS_INTERVAL_SEC="$2"
       shift 2
       ;;
     --drama)
@@ -142,8 +203,12 @@ SHOGUN_WATCH_CMD=""
 if [[ "$LEADER_WATCH" -eq 1 ]]; then
   SHOGUN_WATCH_CMD="bin/shogun-mailbox-watch --name shogun --mode \"$COMM_MODE\" --interval-sec 2 &"
 fi
+SKILL_DAEMON_CMD=""
+if [[ "$SKILL_AUTOPILOT" -eq 1 ]]; then
+  SKILL_DAEMON_CMD="./bin/shogun-skillflow --mode \"$COMM_MODE\" --sender \"$SKILL_SENDER\" scan --loop --interval-sec \"$SKILL_INTERVAL_SEC\" --min-count \"$SKILL_MIN_COUNT\" >/tmp/shogun-skillflow.log 2>&1 &"
+fi
 tmux send-keys -t "${SHOGUN_SESSION}:0.0" \
-  "cd \"$ROOT_DIR\"; export SHOGUN_NAME=shogun SHOGUN_ROLE=shogun SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo '[将軍] ここは軍議所。委任専任にて動く。'; echo '使い方: bin/shogun-remote run \"<command>\"'; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name shogun --status working --session \"$SHOGUN_SESSION\" --pane 0 >/dev/null; ${SHOGUN_WATCH_CMD} echo '[将軍] 下知を待つ。'" C-m
+  "cd \"$ROOT_DIR\"; export SHOGUN_NAME=shogun SHOGUN_ROLE=shogun SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo '[将軍] ここは軍議所。委任専任にて動く。'; echo '使い方: bin/shogun-remote run \"<command>\"'; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; echo \"skill autopilot: $SKILL_AUTOPILOT\"; bin/shogunctl member set-status --name shogun --status working --session \"$SHOGUN_SESSION\" --pane 0 >/dev/null; ${SHOGUN_WATCH_CMD}${SKILL_DAEMON_CMD} echo '[将軍] 下知を待つ。'" C-m
 
 if [[ "$SHOW_FEED" -eq 1 ]]; then
   tmux split-window -t "${SHOGUN_SESSION}:0.0" -v -p 45
@@ -158,6 +223,17 @@ for ((i=1; i<TOTAL_PANES; i++)); do
   tmux split-window -t "${MULTIAGENT_SESSION}:0" -d
   tmux select-layout -t "${MULTIAGENT_SESSION}:0" tiled >/dev/null
 done
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_COMM_MODE "$COMM_MODE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_DRAMA_MODE "$DRAMA_MODE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_DIALOGUE_MODE "$DIALOGUE_MODE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_DIALOGUE_CODEX_BIN "$DIALOGUE_CODEX_BIN"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_SAMURAI_TONE "$SAMURAI_TONE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_KARO_DECOMPOSE_MODE "$KARO_DECOMPOSE_MODE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_KARO_CODEX_BIN "$KARO_CODEX_BIN"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_ASHIGARU_EXEC_MODE "$ASHIGARU_EXEC_MODE"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_ASHIGARU_CODEX_BIN "$ASHIGARU_CODEX_BIN"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_ASHIGARU_ACK_WAIT_SEC "$ASHIGARU_ACK_WAIT_SEC"
+tmux set-environment -t "${MULTIAGENT_SESSION}" SHOGUN_ASHIGARU_PROGRESS_INTERVAL_SEC "$ASHIGARU_PROGRESS_INTERVAL_SEC"
 
 PANE_INDICES=($(tmux list-panes -t "${MULTIAGENT_SESSION}:0" -F '#{pane_index}' | sort -n))
 NAMES=("karo" "metsuke")
@@ -177,10 +253,10 @@ for idx in "${!NAMES[@]}"; do
   fi
   if [[ "$AUTOPILOT" -eq 1 ]]; then
     tmux send-keys -t "${MULTIAGENT_SESSION}:0.${pane}" \
-      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo \"[$name/$role] 出陣準備よし\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi; echo \"[$name/$role] 自動運用を開始する\"; exec bin/shogun-agent --name \"$name\" --role \"$role\" --mode \"$COMM_MODE\" --interval-sec \"$AGENT_INTERVAL\"" C-m
+      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\"; clear; echo \"[$name/$role] 出陣準備よし\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; echo \"karo decompose: $KARO_DECOMPOSE_MODE\"; echo \"ashigaru exec: $ASHIGARU_EXEC_MODE\"; echo \"dialogue mode: $DIALOGUE_MODE\"; echo \"samurai tone: $SAMURAI_TONE\"; echo \"ack wait sec: $ASHIGARU_ACK_WAIT_SEC\"; echo \"progress interval sec: $ASHIGARU_PROGRESS_INTERVAL_SEC\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi; echo \"[$name/$role] 自動運用を開始する\"; exec bin/shogun-agent --name \"$name\" --role \"$role\" --interval-sec \"$AGENT_INTERVAL\"" C-m
   else
     tmux send-keys -t "${MULTIAGENT_SESSION}:0.${pane}" \
-      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\" SHOGUN_COMM_MODE=\"$COMM_MODE\" SHOGUN_DRAMA_MODE=\"$DRAMA_MODE\"; clear; echo \"[$name/$role] ready\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi" C-m
+      "cd \"$ROOT_DIR\"; export SHOGUN_NAME=\"$name\" SHOGUN_ROLE=\"$role\"; clear; echo \"[$name/$role] ready\"; echo \"instruction: instructions/$role.md\"; echo \"comm mode: $COMM_MODE\"; echo \"drama mode: $DRAMA_MODE\"; bin/shogunctl member set-status --name \"$name\" --status idle --session \"$MULTIAGENT_SESSION\" --pane \"$pane\" >/dev/null; ${WATCH_CMD}if [[ -n \"\${SHOGUN_AGENT_BOOT_CMD:-}\" ]]; then eval \"\$SHOGUN_AGENT_BOOT_CMD\"; fi" C-m
   fi
 done
 
@@ -207,6 +283,17 @@ if [[ "$DRAMA_MODE" -eq 1 ]]; then
   echo "drama mode: enabled (warrior chatter/persona/rules)"
 else
   echo "drama mode: disabled"
+fi
+echo "karo decomposition: $KARO_DECOMPOSE_MODE"
+echo "ashigaru execution: $ASHIGARU_EXEC_MODE"
+echo "dialogue mode: $DIALOGUE_MODE"
+echo "samurai tone: $SAMURAI_TONE"
+echo "ashigaru ack wait sec: $ASHIGARU_ACK_WAIT_SEC"
+echo "ashigaru progress interval sec: $ASHIGARU_PROGRESS_INTERVAL_SEC"
+if [[ "$SKILL_AUTOPILOT" -eq 1 ]]; then
+  echo "skill autopilot: enabled (interval=${SKILL_INTERVAL_SEC}s min-count=${SKILL_MIN_COUNT} sender=${SKILL_SENDER})"
+else
+  echo "skill autopilot: disabled"
 fi
 if [[ "$START_WATCHERS" -eq 1 ]]; then
   echo "watchers: enabled (logs in /tmp/shogun-watch-*.log)"

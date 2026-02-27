@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sqlite3
 import sys
 import time
@@ -177,11 +178,87 @@ def print_message(row: sqlite3.Row, truncate: int) -> None:
     print_multiline("", content)
 
 
+def load_cursor(path: Path) -> tuple[int, int]:
+    if not path.exists():
+        return 0, 0
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return 0, 0
+    if not isinstance(payload, dict):
+        return 0, 0
+    event_id = int(payload.get("last_event_id") or 0)
+    message_id = int(payload.get("last_message_id") or 0)
+    return max(0, event_id), max(0, message_id)
+
+
+def save_cursor(path: Path, event_id: int, message_id: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_event_id": int(event_id), "last_message_id": int(message_id)}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def fetch_events_after(conn: sqlite3.Connection, after_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT
+          e.id,
+          e.task_id,
+          COALESCE(t.subject, '') AS subject,
+          e.actor,
+          e.event_type,
+          COALESCE(e.detail, '') AS detail,
+          e.created_at
+        FROM task_events e
+        LEFT JOIN tasks t ON t.id = e.task_id
+        WHERE e.id > ?
+        ORDER BY e.id ASC
+        """,
+        (after_id,),
+    ).fetchall()
+
+
+def fetch_messages_after(conn: sqlite3.Connection, after_id: int) -> list[sqlite3.Row]:
+    return conn.execute(
+        """
+        SELECT id, sender, recipient, kind, task_id, created_at, content
+        FROM messages
+        WHERE id > ?
+        ORDER BY id ASC
+        """,
+        (after_id,),
+    ).fetchall()
+
+
 def run(args: argparse.Namespace) -> int:
     with connect(args.db) as conn:
         print(f"[軍議録] db={args.db}", flush=True)
+        print(
+            f"[軍議録] mode={'delta' if args.delta_only else ('no-tail' if args.no_tail else 'tail')} interval={args.interval_sec}s",
+            flush=True,
+        )
 
-        if args.no_tail:
+        cursor_event_id = 0
+        cursor_msg_id = 0
+        if args.cursor_file:
+            if args.cursor_reset and args.cursor_file.exists():
+                args.cursor_file.unlink(missing_ok=True)
+            cursor_event_id, cursor_msg_id = load_cursor(args.cursor_file)
+        if args.since_event_id is not None:
+            cursor_event_id = max(0, args.since_event_id)
+        if args.since_message_id is not None:
+            cursor_msg_id = max(0, args.since_message_id)
+
+        if args.delta_only:
+            tail_events = fetch_events_after(conn, cursor_event_id)
+            tail_messages = fetch_messages_after(conn, cursor_msg_id)
+            for row in tail_events:
+                print_event(row, args.truncate)
+            for row in tail_messages:
+                print_message(row, args.truncate)
+            last_event_id = tail_events[-1]["id"] if tail_events else cursor_event_id
+            last_msg_id = tail_messages[-1]["id"] if tail_messages else cursor_msg_id
+        elif args.no_tail:
             last_event_id, last_msg_id = max_ids(conn)
         else:
             tail_events = fetch_tail_events(conn, args.tail_events)
@@ -193,18 +270,38 @@ def run(args: argparse.Namespace) -> int:
             last_event_id = tail_events[-1]["id"] if tail_events else max_ids(conn)[0]
             last_msg_id = tail_messages[-1]["id"] if tail_messages else max_ids(conn)[1]
 
+        if args.cursor_file:
+            save_cursor(args.cursor_file, last_event_id, last_msg_id)
+
         if args.once:
             return 0
 
+        last_emit = time.time()
         while True:
             events = fetch_new_events(conn, last_event_id, args.batch_limit)
             messages = fetch_new_messages(conn, last_msg_id, args.batch_limit)
             for row in events:
                 print_event(row, args.truncate)
                 last_event_id = int(row["id"])
+                last_emit = time.time()
             for row in messages:
                 print_message(row, args.truncate)
                 last_msg_id = int(row["id"])
+                last_emit = time.time()
+            if (
+                not events
+                and not messages
+                and args.heartbeat_sec > 0
+                and (time.time() - last_emit) >= args.heartbeat_sec
+            ):
+                print(
+                    f"[軍議録] 待機中: no new events/messages "
+                    f"(event_cursor={last_event_id}, message_cursor={last_msg_id})",
+                    flush=True,
+                )
+                last_emit = time.time()
+            if args.cursor_file:
+                save_cursor(args.cursor_file, last_event_id, last_msg_id)
             time.sleep(max(0.2, args.interval_sec))
 
 
@@ -214,8 +311,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--tail-events", type=int, default=0, help="0 means all events")
     parser.add_argument("--tail-messages", type=int, default=0, help="0 means all messages")
     parser.add_argument("--no-tail", action="store_true")
+    parser.add_argument("--delta-only", action="store_true", help="Print only rows newer than cursor/since ids")
+    parser.add_argument("--since-event-id", type=int, default=None)
+    parser.add_argument("--since-message-id", type=int, default=None)
+    parser.add_argument("--cursor-file", type=parse_path, default=None, help="Persist last printed ids")
+    parser.add_argument("--cursor-reset", action="store_true", help="Reset cursor file before reading")
     parser.add_argument("--truncate", type=int, default=0, help="0 means full text")
     parser.add_argument("--interval-sec", type=float, default=1.0)
+    parser.add_argument(
+        "--heartbeat-sec",
+        type=float,
+        default=5.0,
+        help="Print idle heartbeat while following (0 disables).",
+    )
     parser.add_argument("--batch-limit", type=int, default=200)
     parser.add_argument("--once", action="store_true")
     return parser

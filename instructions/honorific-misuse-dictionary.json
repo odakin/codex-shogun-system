@@ -1,0 +1,124 @@
+{
+  "version": "1.0.0",
+  "updated_at": "2026-02-27",
+  "scope": "将軍システムの進捗上申文（呼称ガード用）",
+  "canonical": {
+    "user": "上様",
+    "shogun": "将軍殿",
+    "karo": "家老殿",
+    "metsuke": "目付殿"
+  },
+  "entries": [
+    {
+      "id": "role-reversal-001",
+      "category": "役職逆転",
+      "applies_when": {
+        "recipient": "karo"
+      },
+      "detect_regex": [
+        "(^|\\n)将軍殿[、,]"
+      ],
+      "misuse_example": "将軍殿、任務 #173 の進捗を上申します。",
+      "expected": "家老殿、任務 #173 の進捗を上申します。"
+    },
+    {
+      "id": "role-reversal-002",
+      "category": "役職逆転",
+      "applies_when": {
+        "recipient": "shogun"
+      },
+      "detect_regex": [
+        "(^|\\n)家老殿[、,]"
+      ],
+      "misuse_example": "家老殿、任務 #170 の進捗を上申します。",
+      "expected": "将軍殿、任務 #170 の進捗を上申します。"
+    },
+    {
+      "id": "role-reversal-003",
+      "category": "役職逆転",
+      "applies_when": {
+        "recipient": "shogun"
+      },
+      "detect_regex": [
+        "上様"
+      ],
+      "misuse_example": "上様、任務 #170 を上申します。",
+      "expected": "将軍殿、任務 #170 を上申します。"
+    },
+    {
+      "id": "missing-honorific-001",
+      "category": "敬称欠落",
+      "applies_when": {
+        "recipient": "karo"
+      },
+      "detect_regex": [
+        "(^|\\n)家老[、,]"
+      ],
+      "misuse_example": "家老、任務 #173 は仕上げ候。",
+      "expected": "家老殿、任務 #173 は仕上げ候。"
+    },
+    {
+      "id": "missing-honorific-002",
+      "category": "敬称欠落",
+      "applies_when": {
+        "recipient": "shogun"
+      },
+      "detect_regex": [
+        "(^|\\n)将軍[、,]"
+      ],
+      "misuse_example": "将軍、任務 #170 は進行中に候。",
+      "expected": "将軍殿、任務 #170 は進行中に候。"
+    },
+    {
+      "id": "missing-honorific-003",
+      "category": "敬称欠落",
+      "applies_when": {
+        "recipient": "user"
+      },
+      "detect_regex": [
+        "(^|\\n)上[、,]"
+      ],
+      "misuse_example": "上、最終報告を申し上げます。",
+      "expected": "上様、最終報告を申し上げます。"
+    },
+    {
+      "id": "subject-mixup-001",
+      "category": "主語取り違え",
+      "applies_when": {
+        "sender": "ashigaru*",
+        "recipient": "karo"
+      },
+      "detect_regex": [
+        "(^|\\n)家老より"
+      ],
+      "misuse_example": "家老より上申。任務 #173 は仕上げ候。",
+      "expected": "ashigaru5より上申。任務 #173 は仕上げ候。"
+    },
+    {
+      "id": "subject-mixup-002",
+      "category": "主語取り違え",
+      "applies_when": {
+        "sender": "karo",
+        "recipient": "shogun"
+      },
+      "detect_regex": [
+        "(^|\\n)将軍(殿)?より"
+      ],
+      "misuse_example": "将軍より上申。任務 #170 を分解しました。",
+      "expected": "家老より上申。任務 #170 を分解しました。"
+    },
+    {
+      "id": "subject-mixup-003",
+      "category": "主語取り違え",
+      "applies_when": {
+        "recipient": "shogun"
+      },
+      "detect_regex": [
+        "将軍殿[^\n]*家老殿",
+        "家老殿[^\n]*将軍殿"
+      ],
+      "misuse_example": "将軍殿、家老殿へ上申した内容を報告します。",
+      "expected": "将軍殿、任務進捗を上申します。"
+    }
+  ]
+}

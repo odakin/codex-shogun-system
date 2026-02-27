@@ -104,7 +104,7 @@ def cmd_task_create(payload: dict[str, str]) -> int:
         "task",
         "create",
         "--actor",
-        payload.get("actor", payload.get("reporter", "system")),
+        payload.get("actor", payload.get("reporter", "shogun")),
         "--subject",
         payload.get("subject", ""),
         "--description",
@@ -268,4 +268,3 @@ def main(argv: list[str] | None = None) -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

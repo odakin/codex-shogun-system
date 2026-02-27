@@ -3,21 +3,28 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TARGET="${SHOGUN_TMUX_TARGET:-shogun:0.0}"
+DB_PATH="${SHOGUN_REMOTE_DB:-$ROOT_DIR/state/shogun.db}"
 DEFAULT_LINES="${SHOGUN_REMOTE_LINES:-60}"
 DEFAULT_WAIT="${SHOGUN_REMOTE_WAIT:-0.4}"
 DEFAULT_STRICT="${SHOGUN_REMOTE_STRICT:-1}"
 DEFAULT_COMM_MODE="${SHOGUN_REMOTE_COMM_MODE:-${SHOGUN_COMM_MODE:-teams}}"
-DEFAULT_SENDER="${SHOGUN_REMOTE_SENDER:-shogun}"
+DEFAULT_SENDER="${SHOGUN_REMOTE_SENDER:-${SHOGUN_NAME:-shogun}}"
 DEFAULT_OWNER="${SHOGUN_REMOTE_OWNER:-karo}"
 DEFAULT_RECIPIENT="${SHOGUN_REMOTE_RECIPIENT:-karo}"
 DEFAULT_PRIORITY="${SHOGUN_REMOTE_PRIORITY:-2}"
+DEFAULT_AWAIT="${SHOGUN_REMOTE_AWAIT:-1}"
+DEFAULT_AWAIT_TIMEOUT_SEC="${SHOGUN_REMOTE_AWAIT_TIMEOUT_SEC:-180}"
+DEFAULT_AWAIT_POLL_SEC="${SHOGUN_REMOTE_AWAIT_POLL_SEC:-1.0}"
+DEFAULT_STREAM="${SHOGUN_REMOTE_STREAM:-all}"
+
+CREATED_TASK_ID=""
 
 usage() {
   cat <<'EOF'
 Remote control helper for the shogun tmux pane.
 
 Usage:
-  bin/shogun-remote [--target SESSION:WINDOW.PANE] <command> [args...]
+  bin/shogun-remote [--target SESSION:WINDOW.PANE] [--db PATH] <command> [args...]
 
 Commands:
   status
@@ -26,13 +33,29 @@ Commands:
       Send raw text to pane (without Enter).
   enter
       Send Enter.
+  ask [options] <request text...>
+      Delegate a thinking/planning/research request to karo via task+message.
+      Default behavior waits for task completion and prints shogun final report.
+      Options:
+        --await | --no-await
+        --await-timeout-sec N
+        --await-poll-sec SEC
+        --stream MODE (all|task|shogun|off)
+        --sender NAME --owner NAME --recipient NAME
+        --priority N --comm-mode MODE
+        --subject TEXT --description TEXT
   run [--wait SEC] [--lines N] [--no-capture] <shell command...>
       Strict delegate mode (default): create Task + send Message to karo.
+      Default behavior waits for task completion and prints shogun final report.
       Use --direct to bypass and run command in pane.
       Options:
         --direct
         --delegate
         --strict 0|1
+        --await | --no-await
+        --await-timeout-sec N
+        --await-poll-sec SEC
+        --stream MODE (all|task|shogun|off)
         --sender NAME --owner NAME --recipient NAME
         --priority N --comm-mode MODE
         --subject TEXT --description TEXT
@@ -45,6 +68,7 @@ Commands:
 
 Examples:
   bin/shogun-remote status
+  bin/shogun-remote ask "本家との差分を比較し、改善案を3つ提案せよ"
   bin/shogun-remote run "bin/shogunctl status"
   bin/shogun-remote run --direct "bin/shogunctl status"
   bin/shogun-remote run --subject "実装依頼" "pnpm run test"
@@ -65,18 +89,264 @@ capture_tail() {
   tmux capture-pane -t "$TARGET" -p | tail -n "$lines"
 }
 
-create_delegated_task() {
-  local run_cmd="$1"
-  local sender="$2"
-  local owner="$3"
-  local recipient="$4"
-  local priority="$5"
-  local comm_mode="$6"
-  local subject="$7"
-  local description="$8"
+query_task_status() {
+  local task_id="$1"
+  python3 - "$DB_PATH" "$task_id" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+task_id = int(sys.argv[2])
+conn = sqlite3.connect(db_path)
+row = conn.execute("SELECT status FROM tasks WHERE id = ?", (task_id,)).fetchone()
+print(row[0] if row else "")
+PY
+}
+
+query_max_ids() {
+  python3 - "$DB_PATH" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+conn = sqlite3.connect(db_path)
+msg = conn.execute("SELECT COALESCE(MAX(id), 0) FROM messages").fetchone()[0]
+ev = conn.execute("SELECT COALESCE(MAX(id), 0) FROM task_events").fetchone()[0]
+print(f"{msg} {ev}")
+PY
+}
+
+print_latest_report_to_shogun() {
+  local task_id="$1"
+  python3 - "$DB_PATH" "$task_id" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+task_id = int(sys.argv[2])
+conn = sqlite3.connect(db_path)
+row = conn.execute(
+    """
+    SELECT sender, created_at, content
+    FROM messages
+    WHERE task_id = ? AND recipient = 'shogun'
+    ORDER BY id DESC
+    LIMIT 1
+    """,
+    (task_id,),
+).fetchone()
+
+if not row:
+    print("[将軍] 上様への最終報告: (該当メッセージ未検出)")
+else:
+    sender, created_at, content = row
+    print(f"[将軍] 上様への最終報告（受領元={sender} / {created_at}）")
+    print(content)
+PY
+}
+
+stream_new_updates() {
+  local task_id="$1"
+  local since_msg_id="$2"
+  local since_event_id="$3"
+  local stream_mode="$4"
+  python3 - "$DB_PATH" "$task_id" "$since_msg_id" "$since_event_id" "$stream_mode" <<'PY'
+import sqlite3
+import sys
+
+db_path = sys.argv[1]
+task_id = int(sys.argv[2])
+since_msg_id = int(sys.argv[3])
+since_event_id = int(sys.argv[4])
+stream_mode = sys.argv[5].strip().lower()
+
+conn = sqlite3.connect(db_path)
+
+def print_multiline(text: str) -> None:
+    text = (text or "").strip("\n")
+    if not text:
+        print("  (empty)")
+        return
+    for line in text.splitlines():
+        print(f"  {line}")
+
+msg_sql = ""
+msg_params = ()
+if stream_mode == "off":
+    msg_sql = ""
+elif stream_mode == "shogun":
+    msg_sql = """
+    SELECT id, sender, recipient, kind, task_id, created_at, content
+    FROM messages
+    WHERE task_id = ? AND recipient = 'shogun' AND id > ?
+    ORDER BY id ASC
+    """
+    msg_params = (task_id, since_msg_id)
+elif stream_mode == "task":
+    msg_sql = """
+    SELECT id, sender, recipient, kind, task_id, created_at, content
+    FROM messages
+    WHERE task_id = ? AND id > ?
+    ORDER BY id ASC
+    """
+    msg_params = (task_id, since_msg_id)
+elif stream_mode == "all":
+    msg_sql = """
+    SELECT id, sender, recipient, kind, task_id, created_at, content
+    FROM messages
+    WHERE id > ?
+    ORDER BY id ASC
+    """
+    msg_params = (since_msg_id,)
+else:
+    # fallback to task scope for unknown mode
+    stream_mode = "task"
+    msg_sql = """
+    SELECT id, sender, recipient, kind, task_id, created_at, content
+    FROM messages
+    WHERE task_id = ? AND id > ?
+    ORDER BY id ASC
+    """
+    msg_params = (task_id, since_msg_id)
+
+messages = conn.execute(msg_sql, msg_params).fetchall() if msg_sql else []
+last_msg_id = since_msg_id
+for msg_id, sender, recipient, kind, t_id, created_at, content in messages:
+    print(
+        f"[軍議][msg#{msg_id}] {created_at} {sender} -> {recipient} "
+        f"kind={kind} task={t_id if t_id is not None else '-'}"
+    )
+    print_multiline(content or "")
+    print("")
+    last_msg_id = msg_id
+
+event_sql = ""
+event_params = ()
+if stream_mode == "all":
+    event_sql = """
+    SELECT e.id, e.task_id, COALESCE(t.subject, ''), e.actor, e.event_type, COALESCE(e.detail, ''), e.created_at
+    FROM task_events e
+    LEFT JOIN tasks t ON t.id = e.task_id
+    WHERE e.id > ?
+    ORDER BY e.id ASC
+    """
+    event_params = (since_event_id,)
+elif stream_mode in {"task", "shogun"}:
+    event_sql = """
+    SELECT e.id, e.task_id, COALESCE(t.subject, ''), e.actor, e.event_type, COALESCE(e.detail, ''), e.created_at
+    FROM task_events e
+    LEFT JOIN tasks t ON t.id = e.task_id
+    WHERE e.task_id = ? AND e.id > ?
+    ORDER BY e.id ASC
+    """
+    event_params = (task_id, since_event_id)
+
+events = conn.execute(event_sql, event_params).fetchall() if event_sql else []
+last_event_id = since_event_id
+for ev_id, t_id, subject, actor, ev_type, detail, created_at in events:
+    print(
+        f"[軍議][event#{ev_id}] {created_at} task={t_id} actor={actor} "
+        f"type={ev_type} subject={subject}"
+    )
+    print_multiline(detail or "")
+    print("")
+    last_event_id = ev_id
+
+print(f"__LAST_MSG_ID__={last_msg_id}")
+print(f"__LAST_EVENT_ID__={last_event_id}")
+PY
+}
+
+await_task_completion() {
+  local task_id="$1"
+  local timeout_sec="$2"
+  local poll_sec="$3"
+  local stream_mode="${4:-$DEFAULT_STREAM}"
+  local started_at now elapsed status
+  local last_msg_id last_event_id stream_output stream_body stream_last_msg_line stream_last_event_line max_ids_pair
+
+  started_at="$(date +%s)"
+  last_msg_id=0
+  last_event_id=0
+
+  case "$stream_mode" in
+    all)
+      max_ids_pair="$(query_max_ids)"
+      if [[ -n "$max_ids_pair" ]]; then
+        last_msg_id="$(printf '%s' "$max_ids_pair" | awk '{print $1}')"
+        last_event_id="$(printf '%s' "$max_ids_pair" | awk '{print $2}')"
+      fi
+      ;;
+    off|task|shogun)
+      ;;
+    *)
+      stream_mode="task"
+      ;;
+  esac
+
+  while true; do
+    stream_output="$(stream_new_updates "$task_id" "$last_msg_id" "$last_event_id" "$stream_mode" || true)"
+    stream_last_msg_line="$(printf '%s\n' "$stream_output" | grep '^__LAST_MSG_ID__=' | tail -n 1 || true)"
+    stream_last_event_line="$(printf '%s\n' "$stream_output" | grep '^__LAST_EVENT_ID__=' | tail -n 1 || true)"
+    if [[ "$stream_last_msg_line" == __LAST_MSG_ID__=* ]]; then
+      last_msg_id="${stream_last_msg_line#__LAST_MSG_ID__=}"
+    fi
+    if [[ "$stream_last_event_line" == __LAST_EVENT_ID__=* ]]; then
+      last_event_id="${stream_last_event_line#__LAST_EVENT_ID__=}"
+    fi
+    stream_body="$(printf '%s\n' "$stream_output" | sed '/^__LAST_MSG_ID__=/d;/^__LAST_EVENT_ID__=/d')"
+    if [[ -n "$stream_body" ]]; then
+      if [[ "$stream_body" != "$stream_output" ]]; then
+        if [[ -n "$stream_body" ]]; then
+          printf '%s\n' "$stream_body"
+        fi
+      fi
+    fi
+
+    status="$(query_task_status "$task_id" || true)"
+    case "$status" in
+      done)
+        echo "[将軍] 任務完了: task=$task_id status=done"
+        print_latest_report_to_shogun "$task_id"
+        return 0
+        ;;
+      blocked)
+        echo "[将軍] 任務阻塞: task=$task_id status=blocked"
+        print_latest_report_to_shogun "$task_id"
+        return 2
+        ;;
+      "")
+        echo "[将軍] 任務追跡失敗: task=$task_id が見つからぬ"
+        return 3
+        ;;
+    esac
+
+    if [[ "${timeout_sec:-0}" != "0" ]]; then
+      now="$(date +%s)"
+      elapsed=$((now - started_at))
+      if [[ "$elapsed" -ge "$timeout_sec" ]]; then
+        echo "[将軍] 任務追跡タイムアウト: task=$task_id status=${status:-unknown} elapsed=${elapsed}s"
+        print_latest_report_to_shogun "$task_id"
+        return 124
+      fi
+    fi
+    sleep "$poll_sec"
+  done
+}
+
+create_delegated_order() {
+  local sender="$1"
+  local owner="$2"
+  local recipient="$3"
+  local priority="$4"
+  local comm_mode="$5"
+  local subject="$6"
+  local description="$7"
+  local order_block="$8"
+  local completion_line="$9"
 
   local task_output task_id msg_content
-  task_output="$("$ROOT_DIR/bin/shogunctl" task create \
+  task_output="$("$ROOT_DIR/bin/shogunctl" --db "$DB_PATH" task create \
     --actor "$sender" \
     --owner "$owner" \
     --reporter "$sender" \
@@ -94,20 +364,21 @@ create_delegated_task() {
     echo "error: failed to parse task id from: $task_output" >&2
     exit 1
   fi
+  CREATED_TASK_ID="$task_id"
 
   msg_content=$(
     cat <<EOF
 軍令:
 任務 #$task_id を委任する。
-command:
-$run_cmd
+$order_block
 
-完了後は status=done とし、将軍へ戦果を報告せよ。
+$completion_line
 EOF
   )
 
   "$ROOT_DIR/bin/shogun-comm" \
     --mode "$comm_mode" \
+    --db "$DB_PATH" \
     send \
     --from "$sender" \
     --to "$recipient" \
@@ -125,6 +396,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --target)
       TARGET="$2"
+      shift 2
+      ;;
+    --db)
+      DB_PATH="$2"
       shift 2
       ;;
     -h|--help)
@@ -167,11 +442,135 @@ case "$cmd" in
   enter)
     tmux send-keys -t "$TARGET" C-m
     ;;
+  ask)
+    await_result="$DEFAULT_AWAIT"
+    await_timeout_sec="$DEFAULT_AWAIT_TIMEOUT_SEC"
+    await_poll_sec="$DEFAULT_AWAIT_POLL_SEC"
+    stream_mode="$DEFAULT_STREAM"
+    sender="$DEFAULT_SENDER"
+    owner="$DEFAULT_OWNER"
+    recipient="$DEFAULT_RECIPIENT"
+    priority="$DEFAULT_PRIORITY"
+    comm_mode="$DEFAULT_COMM_MODE"
+    subject=""
+    description=""
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        --await)
+          await_result=1
+          shift
+          ;;
+        --no-await)
+          await_result=0
+          shift
+          ;;
+        --await-timeout-sec)
+          await_timeout_sec="$2"
+          shift 2
+          ;;
+        --await-poll-sec)
+          await_poll_sec="$2"
+          shift 2
+          ;;
+        --stream)
+          stream_mode="$2"
+          shift 2
+          ;;
+        --sender)
+          sender="$2"
+          shift 2
+          ;;
+        --owner)
+          owner="$2"
+          shift 2
+          ;;
+        --recipient)
+          recipient="$2"
+          shift 2
+          ;;
+        --priority)
+          priority="$2"
+          shift 2
+          ;;
+        --comm-mode)
+          comm_mode="$2"
+          shift 2
+          ;;
+        --subject)
+          subject="$2"
+          shift 2
+          ;;
+        --description)
+          description="$2"
+          shift 2
+          ;;
+        *)
+          break
+          ;;
+      esac
+    done
+
+    if [[ $# -lt 1 ]]; then
+      echo "error: ask requires request text" >&2
+      exit 1
+    fi
+
+    request_text="$*"
+    if [[ -z "$subject" ]]; then
+      one_line_request="$(printf '%s' "$request_text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g')"
+      subject="軍議依頼: $one_line_request"
+    fi
+    if [[ -z "$description" ]]; then
+      description=$(
+        cat <<EOF
+将軍より思考系委任（shogun-remote ask）。
+
+request:
+$request_text
+EOF
+      )
+    fi
+
+    order_block=$(
+      cat <<EOF
+依頼:
+$request_text
+
+要件:
+- 実行コマンドの有無に関わらず、必要なら調査・比較・設計を行うこと。
+- 可能な限り分解して並列で進めること。
+- 根拠と結論を将軍へ上申し、必要な追加判断を明示すること。
+EOF
+    )
+
+    create_delegated_order \
+      "$sender" \
+      "$owner" \
+      "$recipient" \
+      "$priority" \
+      "$comm_mode" \
+      "$subject" \
+      "$description" \
+      "$order_block" \
+      "完了後は status=done とし、将軍へ結論・根拠・残課題を報告せよ。"
+
+    if [[ "$await_result" -eq 1 ]]; then
+      await_task_completion "$CREATED_TASK_ID" "$await_timeout_sec" "$await_poll_sec" "$stream_mode"
+      await_rc="$?"
+      if [[ "$await_rc" -ne 0 ]]; then
+        exit "$await_rc"
+      fi
+    fi
+    ;;
   run)
     wait_sec="$DEFAULT_WAIT"
     lines="$DEFAULT_LINES"
     do_capture=1
     strict_mode="$DEFAULT_STRICT"
+    await_result="$DEFAULT_AWAIT"
+    await_timeout_sec="$DEFAULT_AWAIT_TIMEOUT_SEC"
+    await_poll_sec="$DEFAULT_AWAIT_POLL_SEC"
+    stream_mode="$DEFAULT_STREAM"
     force_direct=0
     force_delegate=0
     sender="$DEFAULT_SENDER"
@@ -205,6 +604,26 @@ case "$cmd" in
           ;;
         --strict)
           strict_mode="$2"
+          shift 2
+          ;;
+        --await)
+          await_result=1
+          shift
+          ;;
+        --no-await)
+          await_result=0
+          shift
+          ;;
+        --await-timeout-sec)
+          await_timeout_sec="$2"
+          shift 2
+          ;;
+        --await-poll-sec)
+          await_poll_sec="$2"
+          shift 2
+          ;;
+        --stream)
+          stream_mode="$2"
           shift 2
           ;;
         --sender)
@@ -261,7 +680,29 @@ $run_cmd
 EOF
         )
       fi
-      create_delegated_task "$run_cmd" "$sender" "$owner" "$recipient" "$priority" "$comm_mode" "$subject" "$description"
+      order_block=$(
+        cat <<EOF
+command:
+$run_cmd
+EOF
+      )
+      create_delegated_order \
+        "$sender" \
+        "$owner" \
+        "$recipient" \
+        "$priority" \
+        "$comm_mode" \
+        "$subject" \
+        "$description" \
+        "$order_block" \
+        "完了後は status=done とし、将軍へ戦果を報告せよ。"
+      if [[ "$await_result" -eq 1 ]]; then
+        await_task_completion "$CREATED_TASK_ID" "$await_timeout_sec" "$await_poll_sec" "$stream_mode"
+        await_rc="$?"
+        if [[ "$await_rc" -ne 0 ]]; then
+          exit "$await_rc"
+        fi
+      fi
       exit 0
     fi
 

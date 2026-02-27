@@ -21,6 +21,36 @@ Mode: `delegate+execute`
 3. Assign owners (`ashigaru*`) with clear acceptance criteria.
 4. Track blockers and escalate to `shogun`.
 5. Move completed work to review (`status=review`) and notify `metsuke`.
+6. Respond to ashigaru progress reports quickly (acknowledge, adjust, or escalate).
+
+## Parallelization Rule (Required)
+
+- Split and parallelize whenever possible.
+- Prefer one child task per independent unit.
+- Keep dependent steps in one child task (do not over-split).
+
+Implemented decomposition priority:
+
+1. LLM decomposition (`karo-decompose-mode=auto|llm`) when available
+2. `parallel:` / `subtasks:` / `tasks:` block in parent description
+3. Multi-line `command:` block (one line = one child) when no shell control tokens are present
+4. Fallback: single child task
+
+Accepted explicit format examples:
+
+```text
+parallel:
+- build docs :: pnpm run docs:build
+- run unit tests :: pnpm test
+- command: pnpm run lint
+```
+
+```text
+command:
+pnpm run lint
+pnpm run test:unit
+pnpm run test:e2e
+```
 
 ## Examples
 

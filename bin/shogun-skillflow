@@ -1,0 +1,1268 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+
+PROPOSAL_STATUSES = ("proposed", "approved", "rejected")
+
+LOW_VALUE_SIGNATURES = {
+    "echo",
+    "printf",
+    "pwd",
+    "date",
+    "ls",
+    "cat",
+    "whoami",
+}
+
+HIGH_VALUE_SIGNATURES = {
+    "rg",
+    "git",
+    "pytest",
+    "pnpm test",
+    "npm test",
+    "cargo test",
+    "go test",
+    "curl",
+    "shogun-remote ask",
+    "shogun-remote run",
+}
+
+OFFICIAL_DOC_SOURCES: dict[str, list[str]] = {
+    "rg": [
+        "https://github.com/BurntSushi/ripgrep/blob/master/GUIDE.md",
+    ],
+    "git": [
+        "https://git-scm.com/docs",
+    ],
+    "curl": [
+        "https://curl.se/docs/manpage.html",
+    ],
+    "pytest": [
+        "https://docs.pytest.org/en/stable/",
+    ],
+    "pnpm": [
+        "https://pnpm.io/cli",
+    ],
+    "npm": [
+        "https://docs.npmjs.com/cli/",
+    ],
+    "cargo": [
+        "https://doc.rust-lang.org/cargo/commands/",
+    ],
+    "go": [
+        "https://pkg.go.dev/cmd/go",
+    ],
+}
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def root_dir() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def default_db_path() -> Path:
+    return root_dir() / "state" / "shogun.db"
+
+
+def default_drafts_dir() -> Path:
+    return root_dir() / "state" / "skill-drafts"
+
+
+def default_publish_dir() -> Path:
+    return root_dir() / "skills"
+
+
+def parse_path(value: str) -> Path:
+    return Path(value).expanduser().resolve()
+
+
+def connect(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(db_path))
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA busy_timeout = 5000")
+    return conn
+
+
+def table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+    return {str(row["name"]) for row in rows}
+
+
+def ensure_column(conn: sqlite3.Connection, table: str, name: str, decl: str) -> None:
+    if name in table_columns(conn, table):
+        return
+    conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def ensure_tables(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS skill_observations (
+          task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
+          command TEXT NOT NULL,
+          signature TEXT NOT NULL,
+          observed_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS skill_proposals (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          signature TEXT NOT NULL,
+          slug TEXT NOT NULL,
+          title TEXT NOT NULL,
+          description TEXT NOT NULL,
+          rationale TEXT NOT NULL,
+          sample_task_ids TEXT NOT NULL,
+          observed_count INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL CHECK(status IN ('proposed','approved','rejected')) DEFAULT 'proposed',
+          draft_dir TEXT,
+          published_dir TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          decided_at TEXT,
+          decided_by TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_skill_observations_signature
+          ON skill_observations(signature);
+        CREATE INDEX IF NOT EXISTS idx_skill_proposals_signature
+          ON skill_proposals(signature);
+        CREATE INDEX IF NOT EXISTS idx_skill_proposals_status
+          ON skill_proposals(status);
+        """
+    )
+    # Forward-compatible columns for richer proposal quality gates.
+    ensure_column(conn, "skill_proposals", "gate_score", "REAL NOT NULL DEFAULT 0")
+    ensure_column(conn, "skill_proposals", "gate_reason", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "skill_proposals", "duplicate_of", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "skill_proposals", "research_json", "TEXT NOT NULL DEFAULT ''")
+    ensure_column(conn, "skill_proposals", "docs_json", "TEXT NOT NULL DEFAULT ''")
+
+
+def extract_command(description: str) -> str | None:
+    if not description:
+        return None
+    lines = description.splitlines()
+    for idx, raw in enumerate(lines):
+        line = raw.strip()
+        if not line.lower().startswith("command:"):
+            continue
+        inline = line[len("command:") :].strip()
+        if inline:
+            return inline
+        block: list[str] = []
+        for next_line in lines[idx + 1 :]:
+            stripped = next_line.strip()
+            if stripped == "":
+                break
+            block.append(next_line)
+        merged = "\n".join(block).strip()
+        return merged or None
+    return None
+
+
+def first_segment(command: str) -> str:
+    segment = re.split(r"\s*(?:&&|\|\||;|\|)\s*", command, maxsplit=1)[0]
+    return segment.strip()
+
+
+def normalize_signature(command: str) -> str:
+    segment = first_segment(command)
+    if not segment:
+        return ""
+    try:
+        tokens = shlex.split(segment, posix=True)
+    except ValueError:
+        tokens = segment.split()
+    if not tokens:
+        return ""
+
+    tool = Path(tokens[0]).name.lower()
+    signature = [tool]
+    if tool in {"git", "pnpm", "npm", "cargo", "go", "uv", "python", "python3", "node", "pip", "pip3"}:
+        if len(tokens) > 1:
+            candidate = tokens[1]
+            if candidate.startswith("-") and len(tokens) > 2:
+                candidate = tokens[2]
+            signature.append(Path(candidate).name.lower())
+    elif tool in {"shogunctl", "shogun-remote"}:
+        if len(tokens) > 1:
+            signature.append(tokens[1].lower())
+    return " ".join(part for part in signature if part)
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    if not slug:
+        slug = "workflow"
+    return slug[:56]
+
+
+def format_rows(rows: list[sqlite3.Row], columns: list[str]) -> str:
+    if not rows:
+        return "(none)"
+    widths = {col: len(col) for col in columns}
+    for row in rows:
+        for col in columns:
+            widths[col] = max(widths[col], len("" if row[col] is None else str(row[col])))
+    header = "  ".join(col.ljust(widths[col]) for col in columns)
+    sep = "  ".join("-" * widths[col] for col in columns)
+    lines = [header, sep]
+    for row in rows:
+        lines.append(
+            "  ".join(
+                ("" if row[col] is None else str(row[col])).ljust(widths[col])
+                for col in columns
+            )
+        )
+    return "\n".join(lines)
+
+
+def ingest_observations(conn: sqlite3.Connection) -> int:
+    rows = conn.execute(
+        """
+        SELECT t.id, t.description
+        FROM tasks t
+        LEFT JOIN skill_observations o ON o.task_id = t.id
+        WHERE t.status = 'done' AND o.task_id IS NULL
+        ORDER BY t.id ASC
+        """
+    ).fetchall()
+    inserted = 0
+    for row in rows:
+        command = extract_command(str(row["description"] or ""))
+        if not command:
+            continue
+        signature = normalize_signature(command)
+        if not signature:
+            continue
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO skill_observations(task_id, command, signature, observed_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (int(row["id"]), command.strip(), signature, utc_now()),
+        )
+        inserted += 1
+    return inserted
+
+
+def load_subject_map(conn: sqlite3.Connection, task_ids: list[int]) -> dict[int, str]:
+    if not task_ids:
+        return {}
+    placeholders = ",".join("?" for _ in task_ids)
+    rows = conn.execute(
+        f"SELECT id, subject FROM tasks WHERE id IN ({placeholders})",
+        tuple(task_ids),
+    ).fetchall()
+    return {int(row["id"]): str(row["subject"] or "") for row in rows}
+
+
+def existing_signature_statuses(conn: sqlite3.Connection) -> dict[str, set[str]]:
+    rows = conn.execute("SELECT signature, status FROM skill_proposals").fetchall()
+    out: dict[str, set[str]] = {}
+    for row in rows:
+        sig = str(row["signature"] or "")
+        out.setdefault(sig, set()).add(str(row["status"] or ""))
+    return out
+
+
+def choose_slug(conn: sqlite3.Connection, signature: str) -> str:
+    base = slugify(signature)
+    slug = f"{base}-skill"
+    exists = conn.execute("SELECT 1 FROM skill_proposals WHERE slug = ? LIMIT 1", (slug,)).fetchone()
+    if not exists:
+        return slug
+    for idx in range(2, 100):
+        candidate = f"{base}-skill-{idx}"
+        exists = conn.execute("SELECT 1 FROM skill_proposals WHERE slug = ? LIMIT 1", (candidate,)).fetchone()
+        if not exists:
+            return candidate
+    return f"{base}-skill-{int(time.time())}"
+
+
+def list_local_skill_signatures(publish_dir: Path) -> set[str]:
+    signatures: set[str] = set()
+    if not publish_dir.exists():
+        return signatures
+    for skill_md in publish_dir.glob("*/SKILL.md"):
+        try:
+            text = skill_md.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        match = re.search(r"repeated '([^']+)' tasks", text, flags=re.IGNORECASE)
+        if match:
+            signatures.add(match.group(1).strip().lower())
+        heading = re.search(r"^#\s+(.+?)\s+Workflow\s*$", text, flags=re.MULTILINE)
+        if heading:
+            signatures.add(heading.group(1).strip().lower())
+    return signatures
+
+
+def detect_codex_binary(candidate: str) -> str | None:
+    if "/" in candidate:
+        path = Path(candidate).expanduser()
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+        return None
+    return shutil.which(candidate)
+
+
+def try_parse_json_payload(text: str) -> dict[str, object] | None:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    candidates: list[str] = [stripped]
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(block.strip() for block in fenced if block.strip())
+    brace_match = re.search(r"\{[\s\S]*\}", stripped)
+    if brace_match:
+        candidates.append(brace_match.group(0).strip())
+    for raw in candidates:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def run_codex_exec_prompt(
+    *,
+    prompt: str,
+    workdir: Path,
+    timeout_sec: int,
+    codex_bin: str,
+    model: str | None,
+) -> tuple[int, str, str, bool]:
+    fd, output_path_raw = tempfile.mkstemp(prefix="skillflow-codex-", suffix=".txt")
+    os.close(fd)
+    output_path = Path(output_path_raw)
+    cmd = [
+        codex_bin,
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "--cd",
+        str(workdir),
+        "--output-last-message",
+        str(output_path),
+        prompt,
+    ]
+    if model:
+        cmd[2:2] = ["--model", model]
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(10, timeout_sec),
+            check=False,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        last_message = ""
+        if output_path.exists():
+            last_message = output_path.read_text(encoding="utf-8", errors="replace")
+        return result.returncode, last_message.strip(), (stdout + "\n" + stderr).strip(), False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode("utf-8", "ignore") if exc.stdout else "")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode("utf-8", "ignore") if exc.stderr else "")
+        return 124, "", (stdout + "\n" + stderr).strip(), True
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def collect_official_docs(
+    *,
+    signature: str,
+    timeout_sec: int,
+    max_bytes: int,
+    per_source_bytes: int,
+) -> dict[str, object]:
+    tool = signature.split()[0] if signature else ""
+    sources = OFFICIAL_DOC_SOURCES.get(tool, [])
+    records: list[dict[str, object]] = []
+    total_bytes = 0
+    for url in sources:
+        cmd = ["curl", "-L", "--max-time", str(timeout_sec), url]
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        if result.returncode != 0:
+            records.append(
+                {
+                    "url": url,
+                    "ok": False,
+                    "error": (result.stderr or "").strip()[:200],
+                    "bytes": 0,
+                }
+            )
+            continue
+        body = (result.stdout or "").strip()
+        if not body:
+            records.append({"url": url, "ok": False, "error": "empty body", "bytes": 0})
+            continue
+        allowed = max(0, min(per_source_bytes, max_bytes - total_bytes))
+        if allowed <= 0:
+            records.append({"url": url, "ok": False, "error": "byte budget exhausted", "bytes": 0})
+            continue
+        snippet = body[:allowed]
+        used = len(snippet.encode("utf-8", errors="ignore"))
+        total_bytes += used
+        records.append(
+            {
+                "url": url,
+                "ok": True,
+                "bytes": used,
+                "snippet": snippet,
+            }
+        )
+        if total_bytes >= max_bytes:
+            break
+    return {
+        "tool": tool,
+        "total_bytes": total_bytes,
+        "sources": records,
+    }
+
+
+def evaluate_value_gate(
+    *,
+    signature: str,
+    observed_count: int,
+    sample_subjects: list[str],
+    commands: list[str],
+    min_score: float,
+) -> dict[str, object]:
+    subject_unique = len({s for s in sample_subjects if s})
+    command_unique = len({c for c in commands if c})
+    common_count = Counter(commands).most_common(1)[0][1] if commands else 0
+    consistency = (common_count / len(commands)) if commands else 0.0
+
+    score = observed_count * 1.4 + subject_unique * 0.6
+    if consistency >= 0.6:
+        score += 1.0
+    if command_unique <= max(1, len(commands) // 2):
+        score += 0.6
+
+    tool = signature.split()[0] if signature else ""
+    if signature in LOW_VALUE_SIGNATURES or tool in LOW_VALUE_SIGNATURES:
+        score -= 3.0
+    if signature in HIGH_VALUE_SIGNATURES or tool in HIGH_VALUE_SIGNATURES:
+        score += 1.2
+
+    reasons: list[str] = [
+        f"observed={observed_count}",
+        f"subject_unique={subject_unique}",
+        f"command_unique={command_unique}",
+        f"consistency={consistency:.2f}",
+    ]
+    passed = score >= min_score
+    if not passed:
+        reasons.append(f"below_threshold(min={min_score:.2f})")
+    return {
+        "score": round(score, 2),
+        "passed": passed,
+        "reason": ", ".join(reasons),
+        "metrics": {
+            "observed_count": observed_count,
+            "subject_unique": subject_unique,
+            "command_unique": command_unique,
+            "consistency": round(consistency, 4),
+        },
+    }
+
+
+def run_market_research(
+    *,
+    signature: str,
+    observed_count: int,
+    sample_subjects: list[str],
+    command_template: str,
+    docs_payload: dict[str, object],
+    codex_bin: str | None,
+    codex_model: str | None,
+    timeout_sec: int,
+) -> dict[str, object]:
+    if codex_bin is None:
+        return {
+            "mode": "heuristic",
+            "recommendation": "defer",
+            "value_statement": "LLM未利用のため簡易評価のみ",
+            "risk": "情報不足",
+            "duplication_risk": "medium",
+            "suggested_scope": "小規模導入で様子見",
+        }
+
+    source_urls = [
+        str(item.get("url"))
+        for item in list(docs_payload.get("sources") or [])
+        if isinstance(item, dict) and item.get("ok")
+    ][:4]
+    prompt = (
+        "あなたはSkill提案の審査官。以下の反復作業をSkill化する価値を評価せよ。"
+        "出力はJSONのみ。\n"
+        "形式:\n"
+        "{\n"
+        '  "recommendation":"propose|defer|reject",\n'
+        '  "value_statement":"短文",\n'
+        '  "risk":"短文",\n'
+        '  "duplication_risk":"low|medium|high",\n'
+        '  "suggested_scope":"短文"\n'
+        "}\n"
+        f"signature: {signature}\n"
+        f"observed_count: {observed_count}\n"
+        f"sample_subjects: {sample_subjects[:6]}\n"
+        f"command_template: {command_template}\n"
+        f"official_sources: {source_urls}\n"
+    )
+    code, answer, _stderr, timed_out = run_codex_exec_prompt(
+        prompt=prompt,
+        workdir=root_dir(),
+        timeout_sec=timeout_sec,
+        codex_bin=codex_bin,
+        model=codex_model,
+    )
+    if timed_out or code != 0 or not answer:
+        return {
+            "mode": "heuristic",
+            "recommendation": "defer",
+            "value_statement": "LLM評価がタイムアウト/失敗",
+            "risk": "外部評価を取得できず",
+            "duplication_risk": "medium",
+            "suggested_scope": "暫定提案として人手確認",
+        }
+    payload = try_parse_json_payload(answer) or {}
+    recommendation = str(payload.get("recommendation") or "defer").strip().lower()
+    if recommendation not in {"propose", "defer", "reject"}:
+        recommendation = "defer"
+    duplication_risk = str(payload.get("duplication_risk") or "medium").strip().lower()
+    if duplication_risk not in {"low", "medium", "high"}:
+        duplication_risk = "medium"
+    return {
+        "mode": "llm",
+        "recommendation": recommendation,
+        "value_statement": str(payload.get("value_statement") or "").strip(),
+        "risk": str(payload.get("risk") or "").strip(),
+        "duplication_risk": duplication_risk,
+        "suggested_scope": str(payload.get("suggested_scope") or "").strip(),
+    }
+
+
+def build_rationale(
+    *,
+    signature: str,
+    gate: dict[str, object],
+    research: dict[str, object],
+    docs_payload: dict[str, object],
+) -> str:
+    parts = [
+        f"signature={signature}",
+        f"gate_score={gate.get('score')}",
+        f"gate_reason={gate.get('reason')}",
+        f"research_recommendation={research.get('recommendation')}",
+    ]
+    if docs_payload.get("total_bytes"):
+        parts.append(f"official_docs_bytes={docs_payload.get('total_bytes')}")
+    if research.get("value_statement"):
+        parts.append(f"value={research.get('value_statement')}")
+    if research.get("risk"):
+        parts.append(f"risk={research.get('risk')}")
+    return "; ".join(str(item) for item in parts if item)
+
+
+def build_skill_markdown(
+    *,
+    slug: str,
+    signature: str,
+    command_template: str,
+    observed_count: int,
+    sample_subjects: list[str],
+    gate: dict[str, object],
+    research: dict[str, object],
+    docs_payload: dict[str, object],
+) -> str:
+    subject_lines = "\n".join(f"- {item}" for item in sample_subjects[:6]) or "- (no samples)"
+    source_urls = [
+        str(item.get("url"))
+        for item in list(docs_payload.get("sources") or [])
+        if isinstance(item, dict) and item.get("ok")
+    ]
+    source_lines = "\n".join(f"- {url}" for url in source_urls[:5]) or "- (none)"
+    return (
+        f"---\n"
+        f"name: {slug}\n"
+        f"description: Reusable workflow auto-generated from repeated '{signature}' tasks in shogun.\n"
+        f"---\n\n"
+        f"# {signature} Workflow\n\n"
+        f"## Trigger\n\n"
+        f"- User asks for work similar to `{signature}`.\n"
+        f"- Repeated operational pattern should be standardized.\n\n"
+        f"## Value Gate\n\n"
+        f"- score: {gate.get('score')}\n"
+        f"- pass: {gate.get('passed')}\n"
+        f"- reason: {gate.get('reason')}\n"
+        f"- market recommendation: {research.get('recommendation')}\n"
+        f"- market value: {research.get('value_statement') or '(none)'}\n"
+        f"- duplication risk: {research.get('duplication_risk') or 'medium'}\n\n"
+        f"## Observed Pattern\n\n"
+        f"- Observed count: {observed_count}\n"
+        f"- Representative tasks:\n"
+        f"{subject_lines}\n\n"
+        f"## Workflow\n\n"
+        f"1. Clarify target and expected output in one line.\n"
+        f"2. Run the command safely with bounded scope and timeout.\n"
+        f"3. Summarize output, blockers, and next actions.\n"
+        f"4. Keep evidence (log excerpt or file path) in the report.\n\n"
+        f"## Command Template\n\n"
+        f"```bash\n"
+        f"{command_template}\n"
+        f"```\n\n"
+        f"## Official References\n\n"
+        f"{source_lines}\n\n"
+        f"## Validation\n\n"
+        f"- Output contains expected signals.\n"
+        f"- Failures include reproducible context.\n"
+        f"- Final report states done/blocked clearly.\n"
+    )
+
+
+def write_draft(
+    *,
+    draft_root: Path,
+    proposal_id: int,
+    slug: str,
+    markdown: str,
+    meta: dict[str, object],
+) -> Path:
+    draft_dir = draft_root / f"{proposal_id:04d}-{slug}"
+    draft_dir.mkdir(parents=True, exist_ok=True)
+    skill_dir = draft_dir / slug
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(markdown, encoding="utf-8")
+    (draft_dir / "proposal.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    return draft_dir
+
+
+def notify_shogun(
+    *,
+    db: Path,
+    mode: str,
+    sender: str,
+    proposal_id: int,
+    signature: str,
+    observed_count: int,
+    draft_dir: Path,
+    gate_score: float,
+    recommendation: str,
+) -> None:
+    content = (
+        f"将軍殿、技能提案 #{proposal_id} を起案いたした。\n"
+        f"- 型: {signature}\n"
+        f"- 観測件数: {observed_count}\n"
+        f"- 価値点: {gate_score}\n"
+        f"- 市場判定: {recommendation}\n"
+        f"- 草案: {draft_dir}\n"
+        f"- 裁可: bin/shogun-skillflow approve --id {proposal_id}\n"
+        f"- 却下: bin/shogun-skillflow reject --id {proposal_id}\n"
+    )
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        mode,
+        "--db",
+        str(db),
+        "send",
+        "--from",
+        sender,
+        "--to",
+        "shogun",
+        "--summary",
+        f"skill proposal #{proposal_id}",
+        "--content",
+        content,
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+
+def notify_decision(
+    *,
+    db: Path,
+    mode: str,
+    sender: str,
+    proposal_id: int,
+    status: str,
+    slug: str,
+    path: Path | None,
+    actor: str,
+) -> None:
+    location = f"\n- 生成先: {path}" if path is not None else ""
+    content = (
+        f"将軍殿、技能提案 #{proposal_id} は {status} に候。\n"
+        f"- slug: {slug}\n"
+        f"- 裁可者: {actor}"
+        f"{location}\n"
+    )
+    cmd = [
+        str(root_dir() / "bin" / "shogun-comm"),
+        "--mode",
+        mode,
+        "--db",
+        str(db),
+        "send",
+        "--from",
+        sender,
+        "--to",
+        "shogun",
+        "--summary",
+        f"skill proposal #{proposal_id} {status}",
+        "--content",
+        content,
+    ]
+    subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+
+def insert_skill_proposal(
+    conn: sqlite3.Connection,
+    *,
+    signature: str,
+    slug: str,
+    title: str,
+    description: str,
+    rationale: str,
+    sample_task_ids: list[int],
+    observed_count: int,
+    status: str,
+    gate_score: float,
+    gate_reason: str,
+    duplicate_of: str,
+    research_json: str,
+    docs_json: str,
+    draft_dir: str,
+    decided_by: str | None = None,
+) -> int:
+    now = utc_now()
+    decided_at = now if status != "proposed" else None
+    conn.execute(
+        """
+        INSERT INTO skill_proposals(
+          signature, slug, title, description, rationale, sample_task_ids, observed_count,
+          status, draft_dir, published_dir, created_at, updated_at, decided_at, decided_by,
+          gate_score, gate_reason, duplicate_of, research_json, docs_json
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            signature,
+            slug,
+            title,
+            description,
+            rationale,
+            json.dumps(sample_task_ids, ensure_ascii=True),
+            observed_count,
+            status,
+            draft_dir,
+            now,
+            now,
+            decided_at,
+            decided_by,
+            gate_score,
+            gate_reason,
+            duplicate_of,
+            research_json,
+            docs_json,
+        ),
+    )
+    return int(conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+
+
+def create_proposals(args: argparse.Namespace, conn: sqlite3.Connection) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    existing = existing_signature_statuses(conn)
+    local_signatures = list_local_skill_signatures(args.publish_dir)
+    rows = conn.execute(
+        """
+        SELECT signature, COUNT(*) AS observed_count
+        FROM skill_observations
+        GROUP BY signature
+        HAVING COUNT(*) >= ?
+        ORDER BY observed_count DESC, signature ASC
+        """,
+        (args.min_count,),
+    ).fetchall()
+
+    created: list[dict[str, object]] = []
+    skipped: list[dict[str, object]] = []
+    args.drafts_dir.mkdir(parents=True, exist_ok=True)
+    codex_bin = detect_codex_binary(args.research_codex_bin) if args.research_llm else None
+
+    for row in rows:
+        signature = str(row["signature"])
+        observed_count = int(row["observed_count"])
+        statuses = existing.get(signature, set())
+        if statuses:
+            skipped.append({"signature": signature, "reason": f"already_proposed:{','.join(sorted(statuses))}"})
+            continue
+        if signature.lower() in local_signatures:
+            skipped.append({"signature": signature, "reason": "duplicate_local_skill"})
+            continue
+
+        sample_rows = conn.execute(
+            """
+            SELECT task_id, command
+            FROM skill_observations
+            WHERE signature = ?
+            ORDER BY task_id DESC
+            LIMIT ?
+            """,
+            (signature, args.sample_limit),
+        ).fetchall()
+        task_ids = [int(item["task_id"]) for item in sample_rows]
+        commands = [str(item["command"]) for item in sample_rows]
+        subjects = load_subject_map(conn, task_ids)
+        sample_subjects = [subjects.get(task_id, f"task#{task_id}") for task_id in task_ids]
+        command_template = Counter(commands).most_common(1)[0][0] if commands else signature
+
+        gate = evaluate_value_gate(
+            signature=signature,
+            observed_count=observed_count,
+            sample_subjects=sample_subjects,
+            commands=commands,
+            min_score=args.gate_min_score,
+        )
+        docs_payload = (
+            collect_official_docs(
+                signature=signature,
+                timeout_sec=args.docs_timeout_sec,
+                max_bytes=args.docs_max_bytes,
+                per_source_bytes=args.docs_per_source_bytes,
+            )
+            if args.research_docs
+            else {"tool": signature.split()[0] if signature else "", "total_bytes": 0, "sources": []}
+        )
+        research = run_market_research(
+            signature=signature,
+            observed_count=observed_count,
+            sample_subjects=sample_subjects,
+            command_template=command_template,
+            docs_payload=docs_payload,
+            codex_bin=codex_bin,
+            codex_model=args.research_codex_model,
+            timeout_sec=args.research_codex_timeout_sec,
+        )
+
+        recommendation = str(research.get("recommendation") or "defer")
+        passed = bool(gate.get("passed"))
+        if recommendation == "reject":
+            passed = False
+        if args.require_llm_propose and args.research_llm and recommendation != "propose":
+            passed = False
+
+        slug = choose_slug(conn, signature)
+        title = f"{signature} workflow"
+        description = f"Auto-proposed reusable workflow for repeated '{signature}' execution."
+        rationale = build_rationale(
+            signature=signature,
+            gate=gate,
+            research=research,
+            docs_payload=docs_payload,
+        )
+        status = "proposed" if passed else "rejected"
+        duplicate_of = ""
+        proposal_id = insert_skill_proposal(
+            conn,
+            signature=signature,
+            slug=slug,
+            title=title,
+            description=description,
+            rationale=rationale,
+            sample_task_ids=task_ids,
+            observed_count=observed_count,
+            status=status,
+            gate_score=float(gate.get("score") or 0.0),
+            gate_reason=str(gate.get("reason") or ""),
+            duplicate_of=duplicate_of,
+            research_json=json.dumps(research, ensure_ascii=False),
+            docs_json=json.dumps(docs_payload, ensure_ascii=False),
+            draft_dir="",
+            decided_by=None if passed else "skillflow-auto",
+        )
+
+        if passed:
+            markdown = build_skill_markdown(
+                slug=slug,
+                signature=signature,
+                command_template=command_template,
+                observed_count=observed_count,
+                sample_subjects=sample_subjects,
+                gate=gate,
+                research=research,
+                docs_payload=docs_payload,
+            )
+            meta = {
+                "proposal_id": proposal_id,
+                "signature": signature,
+                "observed_count": observed_count,
+                "sample_task_ids": task_ids,
+                "sample_subjects": sample_subjects,
+                "command_template": command_template,
+                "gate": gate,
+                "research": research,
+                "docs_summary": {
+                    "tool": docs_payload.get("tool"),
+                    "total_bytes": docs_payload.get("total_bytes"),
+                    "source_count": len(list(docs_payload.get("sources") or [])),
+                },
+            }
+            draft_dir = write_draft(
+                draft_root=args.drafts_dir,
+                proposal_id=proposal_id,
+                slug=slug,
+                markdown=markdown,
+                meta=meta,
+            )
+            conn.execute(
+                """
+                UPDATE skill_proposals
+                SET draft_dir = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (str(draft_dir), utc_now(), proposal_id),
+            )
+            created.append(
+                {
+                    "id": proposal_id,
+                    "signature": signature,
+                    "observed_count": observed_count,
+                    "slug": slug,
+                    "draft_dir": str(draft_dir),
+                    "gate_score": gate.get("score"),
+                    "recommendation": recommendation,
+                }
+            )
+        else:
+            skipped.append(
+                {
+                    "signature": signature,
+                    "reason": "value_gate_reject",
+                    "gate_score": gate.get("score"),
+                    "recommendation": recommendation,
+                    "proposal_id": proposal_id,
+                }
+            )
+
+    return created, skipped
+
+
+def run_scan_once(args: argparse.Namespace) -> dict[str, object]:
+    with connect(args.db) as conn:
+        ensure_tables(conn)
+        observed = ingest_observations(conn)
+        created: list[dict[str, object]] = []
+        skipped: list[dict[str, object]] = []
+        if not args.dry_run:
+            created, skipped = create_proposals(args, conn)
+            conn.commit()
+        else:
+            _, skipped = create_proposals(args, conn)
+            conn.rollback()
+    if args.notify and not args.dry_run:
+        for item in created:
+            try:
+                notify_shogun(
+                    db=args.db,
+                    mode=args.mode,
+                    sender=args.sender,
+                    proposal_id=int(item["id"]),
+                    signature=str(item["signature"]),
+                    observed_count=int(item["observed_count"]),
+                    draft_dir=Path(str(item["draft_dir"])),
+                    gate_score=float(item.get("gate_score") or 0.0),
+                    recommendation=str(item.get("recommendation") or "defer"),
+                )
+            except Exception as exc:  # pragma: no cover
+                print(f"[skillflow] notify failed: proposal#{item['id']} {exc}", file=sys.stderr)
+    return {"observed": observed, "created": created, "skipped": skipped}
+
+
+def load_proposal(conn: sqlite3.Connection, proposal_id: int) -> sqlite3.Row | None:
+    return conn.execute(
+        """
+        SELECT id, signature, slug, title, description, rationale, sample_task_ids, observed_count,
+               status, draft_dir, published_dir, created_at, updated_at, decided_at, decided_by,
+               gate_score, gate_reason, duplicate_of, research_json, docs_json
+        FROM skill_proposals
+        WHERE id = ?
+        """,
+        (proposal_id,),
+    ).fetchone()
+
+
+def approve_proposal(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        ensure_tables(conn)
+        row = load_proposal(conn, args.id)
+        if row is None:
+            print(f"error: proposal #{args.id} not found", file=sys.stderr)
+            return 1
+        if str(row["status"]) != "proposed":
+            print(f"error: proposal #{args.id} is not in proposed status", file=sys.stderr)
+            return 1
+        draft_dir = Path(str(row["draft_dir"] or "")).expanduser()
+        if not draft_dir.exists():
+            print(f"error: draft_dir missing: {draft_dir}", file=sys.stderr)
+            return 1
+        slug = str(row["slug"])
+        src_skill_dir = draft_dir / slug
+        if not src_skill_dir.exists():
+            print(f"error: skill draft missing: {src_skill_dir}", file=sys.stderr)
+            return 1
+        args.publish_dir.mkdir(parents=True, exist_ok=True)
+        dst_skill_dir = args.publish_dir / slug
+        if dst_skill_dir.exists():
+            if not args.force:
+                print(f"error: destination exists: {dst_skill_dir} (use --force)", file=sys.stderr)
+                return 1
+            shutil.rmtree(dst_skill_dir)
+        shutil.copytree(src_skill_dir, dst_skill_dir)
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE skill_proposals
+            SET status = 'approved',
+                published_dir = ?,
+                decided_at = ?,
+                decided_by = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (str(dst_skill_dir), now, args.actor, now, args.id),
+        )
+        conn.commit()
+    if args.notify:
+        notify_decision(
+            db=args.db,
+            mode=args.mode,
+            sender=args.sender,
+            proposal_id=args.id,
+            status="approved",
+            slug=slug,
+            path=dst_skill_dir,
+            actor=args.actor,
+        )
+    print(f"approved proposal #{args.id}: {dst_skill_dir}")
+    return 0
+
+
+def reject_proposal(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        ensure_tables(conn)
+        row = load_proposal(conn, args.id)
+        if row is None:
+            print(f"error: proposal #{args.id} not found", file=sys.stderr)
+            return 1
+        if str(row["status"]) != "proposed":
+            print(f"error: proposal #{args.id} is not in proposed status", file=sys.stderr)
+            return 1
+        now = utc_now()
+        conn.execute(
+            """
+            UPDATE skill_proposals
+            SET status = 'rejected',
+                decided_at = ?,
+                decided_by = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (now, args.actor, now, args.id),
+        )
+        conn.commit()
+    if args.notify:
+        notify_decision(
+            db=args.db,
+            mode=args.mode,
+            sender=args.sender,
+            proposal_id=args.id,
+            status="rejected",
+            slug=str(row["slug"]),
+            path=None,
+            actor=args.actor,
+        )
+    print(f"rejected proposal #{args.id}")
+    return 0
+
+
+def list_proposals(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        ensure_tables(conn)
+        query = """
+          SELECT id, status, signature, observed_count, gate_score, slug, created_at, decided_at
+          FROM skill_proposals
+        """
+        params: list[object] = []
+        if args.status:
+            query += " WHERE status = ?"
+            params.append(args.status)
+        query += " ORDER BY id DESC"
+        rows = conn.execute(query, params).fetchall()
+    if args.json:
+        print(json.dumps([dict(row) for row in rows], ensure_ascii=True, indent=2))
+    else:
+        print(
+            format_rows(
+                rows,
+                ["id", "status", "signature", "observed_count", "gate_score", "slug", "created_at", "decided_at"],
+            )
+        )
+    return 0
+
+
+def show_proposal(args: argparse.Namespace) -> int:
+    with connect(args.db) as conn:
+        ensure_tables(conn)
+        row = load_proposal(conn, args.id)
+        if row is None:
+            print(f"error: proposal #{args.id} not found", file=sys.stderr)
+            return 1
+    if args.json:
+        print(json.dumps(dict(row), ensure_ascii=True, indent=2))
+    else:
+        print(json.dumps(dict(row), ensure_ascii=False, indent=2))
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Auto skill proposal/approval flow for shogun")
+    parser.add_argument("--db", type=parse_path, default=default_db_path())
+    parser.add_argument("--mode", default="teams", choices=("teams", "mailbox", "hybrid", "sendkeys", "ntfy"))
+    parser.add_argument("--sender", default="skillsmith")
+    parser.add_argument("--notify", action="store_true", default=True)
+    parser.add_argument("--no-notify", dest="notify", action="store_false")
+    parser.add_argument("--json", action="store_true")
+
+    sub = parser.add_subparsers(dest="command", required=False)
+
+    p_scan = sub.add_parser("scan", help="Scan completed tasks and create skill proposals")
+    p_scan.add_argument("--loop", action="store_true")
+    p_scan.add_argument("--once", action="store_true", help="Compatibility flag (scan once)")
+    p_scan.add_argument("--interval-sec", type=float, default=30.0)
+    p_scan.add_argument("--min-count", type=int, default=3, help="Minimum repeated observations for proposal")
+    p_scan.add_argument("--sample-limit", type=int, default=8)
+    p_scan.add_argument("--drafts-dir", type=parse_path, default=default_drafts_dir())
+    p_scan.add_argument("--publish-dir", type=parse_path, default=default_publish_dir())
+    p_scan.add_argument("--gate-min-score", type=float, default=4.5)
+    p_scan.add_argument("--docs-timeout-sec", type=int, default=6)
+    p_scan.add_argument("--docs-max-bytes", type=int, default=24000)
+    p_scan.add_argument("--docs-per-source-bytes", type=int, default=8000)
+    p_scan.add_argument("--research-docs", action="store_true", default=True)
+    p_scan.add_argument("--no-research-docs", dest="research_docs", action="store_false")
+    p_scan.add_argument("--research-llm", action="store_true", default=True)
+    p_scan.add_argument("--no-research-llm", dest="research_llm", action="store_false")
+    p_scan.add_argument("--research-codex-bin", default="codex")
+    p_scan.add_argument("--research-codex-model", default=None)
+    p_scan.add_argument("--research-codex-timeout-sec", type=int, default=30)
+    p_scan.add_argument(
+        "--require-llm-propose",
+        action="store_true",
+        help="Only create proposal when LLM recommendation is propose",
+    )
+    p_scan.add_argument("--dry-run", action="store_true")
+    p_scan.add_argument("--json", action="store_true")
+
+    p_list = sub.add_parser("list", help="List skill proposals")
+    p_list.add_argument("--status", choices=PROPOSAL_STATUSES)
+    p_list.add_argument("--json", action="store_true")
+
+    p_show = sub.add_parser("show", help="Show one proposal")
+    p_show.add_argument("--id", type=int, required=True)
+    p_show.add_argument("--json", action="store_true")
+
+    p_approve = sub.add_parser("approve", help="Approve proposal and publish SKILL.md")
+    p_approve.add_argument("--id", type=int, required=True)
+    p_approve.add_argument("--publish-dir", type=parse_path, default=default_publish_dir())
+    p_approve.add_argument("--actor", default="shogun")
+    p_approve.add_argument("--force", action="store_true")
+
+    p_reject = sub.add_parser("reject", help="Reject proposal")
+    p_reject.add_argument("--id", type=int, required=True)
+    p_reject.add_argument("--actor", default="shogun")
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    command = args.command or "scan"
+
+    if command == "scan":
+        if args.loop:
+            while True:
+                result = run_scan_once(args)
+                if args.json:
+                    print(json.dumps(result, ensure_ascii=True))
+                else:
+                    print(
+                        f"[skillflow] observed={result['observed']} "
+                        f"created={len(result['created'])} skipped={len(result['skipped'])}",
+                        flush=True,
+                    )
+                time.sleep(max(0.5, float(args.interval_sec)))
+            return 0
+        result = run_scan_once(args)
+        if args.json:
+            print(json.dumps(result, ensure_ascii=True, indent=2))
+        else:
+            print(f"observed={result['observed']}")
+            print(f"created={len(result['created'])}")
+            print(f"skipped={len(result['skipped'])}")
+            for item in result["created"]:
+                print(
+                    f"- proposal#{item['id']} signature={item['signature']} "
+                    f"count={item['observed_count']} score={item.get('gate_score')} "
+                    f"draft={item['draft_dir']}"
+                )
+        return 0
+    if command == "list":
+        return list_proposals(args)
+    if command == "show":
+        return show_proposal(args)
+    if command == "approve":
+        return approve_proposal(args)
+    if command == "reject":
+        return reject_proposal(args)
+
+    parser.error(f"unknown command: {command}")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

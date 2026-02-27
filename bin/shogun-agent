@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -15,6 +18,81 @@ from pathlib import Path
 TASK_ACTIVE_STATUSES = ("todo", "in_progress", "blocked", "review")
 MESSAGE_MODES = ("teams", "mailbox", "hybrid", "ntfy")
 DEFAULT_DRAMA_MODE = True
+PARALLEL_SECTION_HEADERS = ("parallel:", "subtasks:", "tasks:")
+KARO_DECOMPOSE_MODES = ("rule", "llm", "auto")
+ASHIGARU_EXEC_MODES = ("shell", "codex", "auto")
+DIALOGUE_MODES = ("template", "llm", "auto")
+SAMURAI_TONES = ("light", "strong")
+
+RUNTIME_DIALOGUE_MODE = "auto"
+RUNTIME_DIALOGUE_CODEX_BIN: str | None = None
+RUNTIME_DIALOGUE_CODEX_MODEL: str | None = None
+RUNTIME_DIALOGUE_TIMEOUT_SEC = 25
+RUNTIME_DIALOGUE_WORKDIR: Path | None = None
+RUNTIME_SAMURAI_TONE = "strong"
+
+ASHIGARU_FLOW_STATE: dict[int, dict[str, object]] = {}
+HONORIFIC_MISUSE_DICTIONARY_RELATIVE_PATH = Path("instructions/honorific-misuse-dictionary.json")
+HONORIFIC_GUARD_ENTRIES_CACHE: list[dict[str, object]] | None = None
+
+DEFAULT_HONORIFIC_GUARD_ENTRIES: list[dict[str, object]] = [
+    {
+        "id": "role-reversal-001",
+        "category": "役職逆転",
+        "applies_when": {"recipient": "karo"},
+        "detect_regex": [r"(^|\n)将軍殿[、,]"],
+        "expected": "家老殿、任務 #173 の進捗を上申します。",
+    },
+    {
+        "id": "role-reversal-002",
+        "category": "役職逆転",
+        "applies_when": {"recipient": "shogun"},
+        "detect_regex": [r"(^|\n)家老殿[、,]"],
+        "expected": "将軍殿、任務 #170 の進捗を上申します。",
+    },
+    {
+        "id": "role-reversal-003",
+        "category": "役職逆転",
+        "applies_when": {"recipient": "shogun"},
+        "detect_regex": [r"上様"],
+        "expected": "将軍殿、任務 #170 を上申します。",
+    },
+    {
+        "id": "missing-honorific-001",
+        "category": "敬称欠落",
+        "applies_when": {"recipient": "karo"},
+        "detect_regex": [r"(^|\n)家老[、,]"],
+        "expected": "家老殿、任務 #173 は仕上げ候。",
+    },
+    {
+        "id": "missing-honorific-002",
+        "category": "敬称欠落",
+        "applies_when": {"recipient": "shogun"},
+        "detect_regex": [r"(^|\n)将軍[、,]"],
+        "expected": "将軍殿、任務 #170 は進行中に候。",
+    },
+    {
+        "id": "subject-mixup-001",
+        "category": "主語取り違え",
+        "applies_when": {"sender": "ashigaru*", "recipient": "karo"},
+        "detect_regex": [r"(^|\n)家老より"],
+        "expected": "ashigaru5より上申。任務 #173 は仕上げ候。",
+    },
+    {
+        "id": "subject-mixup-002",
+        "category": "主語取り違え",
+        "applies_when": {"sender": "karo", "recipient": "shogun"},
+        "detect_regex": [r"(^|\n)将軍(殿)?より"],
+        "expected": "家老より上申。任務 #170 を分解しました。",
+    },
+    {
+        "id": "subject-mixup-003",
+        "category": "主語取り違え",
+        "applies_when": {"recipient": "shogun"},
+        "detect_regex": [r"将軍殿[^\n]*家老殿", r"家老殿[^\n]*将軍殿"],
+        "expected": "将軍殿、任務進捗を上申します。",
+    },
+]
 
 PERSONA_RULES: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"(readme|doc|document|仕様|文章|説明)"), "軍記テクニカルライター"),
@@ -32,7 +110,7 @@ WAR_PHRASES: dict[str, tuple[str, ...]] = {
     "karo_complete": (
         "軍配はこちらに上がった。",
         "戦線は安定、次の下知を待つのみ。",
-        "見事な働き、上様へ凱旋報告いたす。",
+        "見事な働き、将軍殿へ凱旋報告いたす。",
     ),
     "ashigaru_start": (
         "槍働き、開始いたす。",
@@ -86,12 +164,12 @@ def war_phrase(kind: str, seed: str) -> str:
     return options[stable_index(f"{kind}:{seed}", len(options))]
 
 
-def choose_persona(subject: str, description: str) -> str:
+def choose_persona(subject: str, description: str) -> str | None:
     text = f"{subject}\n{description}".lower()
     for pattern, persona in PERSONA_RULES:
         if pattern.search(text):
             return persona
-    return "汎用足軽"
+    return None
 
 
 def utc_now() -> str:
@@ -129,6 +207,34 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 def run_command(cmd: list[str], check: bool = True) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, check=check, capture_output=True, text=True)
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return default
+
+
+def env_float(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw.strip())
+    except ValueError:
+        return default
+
+
+def env_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    return value if value else default
 
 
 def short(text: str, limit: int = 96) -> str:
@@ -169,6 +275,13 @@ def shogun_comm_send(
     task_id: int | None = None,
     summary: str | None = None,
 ) -> None:
+    outbound_content = rewrite_dialogue_content(
+        sender=sender,
+        recipient=recipient,
+        content=content,
+        task_id=task_id,
+        summary=summary,
+    )
     cmd = [
         str(root_dir() / "bin" / "shogun-comm"),
         "--mode",
@@ -181,7 +294,7 @@ def shogun_comm_send(
         "--to",
         recipient,
         "--content",
-        content,
+        outbound_content,
     ]
     if summary:
         cmd.extend(["--summary", summary])
@@ -328,26 +441,36 @@ def select_children(db: Path, parent_id: int) -> list[dict[str, object]]:
     return [dict(row) for row in rows]
 
 
-def worker_stats(db: Path) -> list[tuple[str, int, str | None]]:
+def worker_stats(db: Path) -> list[tuple[str, int, str | None, bool, int]]:
     with connect(db) as conn:
         rows = conn.execute(
             """
             SELECT
               m.name AS name,
               COALESCE(SUM(CASE WHEN t.status IN ('todo', 'in_progress', 'blocked', 'review') THEN 1 ELSE 0 END), 0) AS active_load,
-              MAX(t.created_at) AS last_assigned_at
+              MAX(t.created_at) AS last_assigned_at,
+              COALESCE(m.session, '') AS session,
+              COALESCE(m.pane, '') AS pane,
+              COALESCE(m.status, 'idle') AS member_status
             FROM members m
             LEFT JOIN tasks t ON t.owner = m.name
             WHERE m.role = 'worker'
-            GROUP BY m.name
+            GROUP BY m.name, m.session, m.pane, m.status
             ORDER BY m.name ASC
             """,
         ).fetchall()
+    status_rank = {
+        "idle": 0,
+        "working": 1,
+        "blocked": 2,
+    }
     return [
         (
             str(row["name"]),
             int(row["active_load"]),
             str(row["last_assigned_at"]) if row["last_assigned_at"] is not None else None,
+            bool(str(row["session"]).strip() and str(row["pane"]).strip()),
+            status_rank.get(str(row["member_status"]), 9),
         )
         for row in rows
     ]
@@ -357,13 +480,17 @@ def choose_worker(db: Path) -> str | None:
     stats = worker_stats(db)
     if not stats:
         return None
-    # 1) active_load が小さい順
-    # 2) 一度も割当が無い worker を優先
-    # 3) 最終割当が古い順（実質ラウンドロビン）
-    # 4) name で安定化
+    # 1) 有効なエンドポイント(session/paneあり)を優先
+    # 2) member status の健全度（idle -> working -> blocked -> others）
+    # 3) active_load が小さい順
+    # 4) 一度も割当が無い worker を優先
+    # 5) 最終割当が古い順（実質ラウンドロビン）
+    # 6) name で安定化
     ranked = sorted(
         stats,
         key=lambda x: (
+            0 if x[3] else 1,
+            x[4],
             x[1],
             0 if x[2] is None else 1,
             x[2] or "",
@@ -371,6 +498,89 @@ def choose_worker(db: Path) -> str | None:
         ),
     )
     return ranked[0][0]
+
+
+def sanitize_subtask_command(command: str | None) -> tuple[str | None, str | None]:
+    if not command:
+        return None, None
+    lowered = command.lower()
+    forbidden_patterns = (
+        r"\b(?:bin/)?shogun-remote\b",
+        r"\b(?:bin/)?shogun-api\b",
+        r"\b(?:bin/)?shogun-launch\b",
+        r"\b(?:bin/)?shogun-watch(?:dog)?\b",
+        r"\b(?:bin/)?shogun-autoflow\b",
+        r"\b(?:bin/)?shogunctl\s+task\s+create\b",
+    )
+    if any(re.search(pattern, lowered) for pattern in forbidden_patterns):
+        return (
+            None,
+            "制御プレーン操作を検出したため command を無効化（自律実行で対応）。",
+        )
+    return command, None
+
+
+def select_orphan_worker_tasks(db: Path) -> list[dict[str, object]]:
+    with connect(db) as conn:
+        rows = conn.execute(
+            """
+            SELECT
+              t.id,
+              t.subject,
+              t.owner,
+              t.status,
+              COALESCE(m.session, '') AS session,
+              COALESCE(m.pane, '') AS pane
+            FROM tasks t
+            JOIN members m ON m.name = t.owner
+            WHERE m.role = 'worker'
+              AND t.status IN ('todo', 'in_progress', 'blocked')
+              AND (COALESCE(m.session, '') = '' OR COALESCE(m.pane, '') = '')
+            ORDER BY t.priority ASC, t.id ASC
+            """
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def recover_orphan_worker_tasks(args: argparse.Namespace) -> None:
+    label = "家老"
+    orphan_tasks = select_orphan_worker_tasks(args.db)
+    for task in orphan_tasks:
+        task_id = int(task["id"])
+        old_owner = str(task.get("owner") or "")
+        old_status = str(task.get("status") or "todo")
+        new_owner = choose_worker(args.db)
+        if not new_owner or new_owner == old_owner:
+            continue
+
+        task_update(args.db, task_id, args.name, owner=new_owner, status="todo")
+        shogun_comm_send(
+            args.db,
+            args.mode,
+            args.name,
+            new_owner,
+            (
+                f"下知: 任務 #{task_id} を再配置する。"
+                f"\n事情: 旧担当 {old_owner} が通信経路未接続につき、再配置候。"
+                f"\n旧状態: {old_status}"
+                "\n仕上げたら status=review とし、家老へ報告せよ。"
+            ),
+            task_id=task_id,
+            summary=f"reassign {task_id}",
+        )
+        shogun_comm_send(
+            args.db,
+            args.mode,
+            args.name,
+            "shogun",
+            (
+                f"将軍殿、任務 #{task_id} は旧担当 {old_owner} の通信経路不達につき、"
+                f"{new_owner} へ再配置いたした。"
+            ),
+            task_id=task_id,
+            summary=f"reassigned {task_id}",
+        )
+        narrate(label, f"任務 #{task_id} を {old_owner} から {new_owner} へ再配置。")
 
 
 def extract_command(text: str) -> str | None:
@@ -392,6 +602,803 @@ def extract_command(text: str) -> str | None:
         cmd = "\n".join(block).strip()
         return cmd or None
     return None
+
+
+def parse_parallel_items(text: str) -> list[dict[str, str]]:
+    items: list[dict[str, str]] = []
+    in_section = False
+    for raw in text.splitlines():
+        line = raw.strip()
+        lowered = line.lower()
+        if not in_section:
+            if lowered in PARALLEL_SECTION_HEADERS:
+                in_section = True
+            continue
+        if not line:
+            continue
+        match = re.match(r"^(?:[-*]\s+|\d+[.)]\s+)(.+)$", line)
+        if not match:
+            if items:
+                break
+            continue
+        body = match.group(1).strip()
+        subject = ""
+        command = ""
+        if body.lower().startswith("command:"):
+            command = body.split(":", 1)[1].strip()
+        elif "::" in body:
+            subject, command = [part.strip() for part in body.split("::", 1)]
+        elif "|" in body:
+            subject, command = [part.strip() for part in body.split("|", 1)]
+        else:
+            command = body
+        if command:
+            items.append({"subject": subject, "command": command})
+    return items
+
+
+def split_multiline_command(command: str | None) -> list[str]:
+    if not command:
+        return []
+    lines = [line.strip() for line in command.splitlines() if line.strip()]
+    if len(lines) < 2:
+        return []
+    for line in lines:
+        # 制御記号を含む複文は依存関係が不明なため自動分割しない。
+        if any(token in line for token in ("&&", "||", "|", ";")):
+            return []
+        lowered = f" {line.lower()} "
+        if any(token in lowered for token in (" if ", " for ", " while ", " then ", " do ", " fi ", " done ")):
+            return []
+    return lines
+
+
+def build_subtask_specs(parent: dict[str, object], max_subtasks: int) -> list[dict[str, str | None]]:
+    specs: list[dict[str, str | None]] = []
+    description = str(parent.get("description") or "")
+    command = extract_command(description)
+
+    explicit_items = parse_parallel_items(description)
+    if explicit_items:
+        for idx, item in enumerate(explicit_items, start=1):
+            specs.append(
+                {
+                    "label": item.get("subject") or f"並列任務 {idx}",
+                    "command": item.get("command"),
+                    "source": "parallel_block",
+                }
+            )
+    else:
+        split_lines = split_multiline_command(command)
+        if split_lines:
+            for idx, line in enumerate(split_lines, start=1):
+                specs.append({"label": f"行分割 {idx}", "command": line, "source": "command_lines"})
+
+    if not specs:
+        specs.append({"label": None, "command": command, "source": "single"})
+
+    if max_subtasks > 0 and len(specs) > max_subtasks:
+        if max_subtasks == 1:
+            merged = "\n".join((spec.get("command") or "") for spec in specs).strip()
+            return [{"label": "統合任務 1", "command": merged or command, "source": "merged"}]
+        merged_specs = specs[: max_subtasks - 1]
+        overflow = specs[max_subtasks - 1 :]
+        merged_command = "\n".join((spec.get("command") or "") for spec in overflow).strip()
+        merged_specs.append(
+            {
+                "label": f"統合任務 {max_subtasks}",
+                "command": merged_command or command,
+                "source": "merged",
+            }
+        )
+        specs = merged_specs
+    return specs
+
+
+def detect_codex_binary(candidate: str) -> str | None:
+    if "/" in candidate:
+        path = Path(candidate).expanduser()
+        if path.exists() and os.access(path, os.X_OK):
+            return str(path)
+        return None
+    return shutil.which(candidate)
+
+
+def try_parse_json_payload(text: str) -> dict[str, object] | None:
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    candidates: list[str] = [stripped]
+
+    fenced = re.findall(r"```(?:json)?\s*(.*?)```", stripped, flags=re.DOTALL | re.IGNORECASE)
+    candidates.extend(block.strip() for block in fenced if block.strip())
+
+    brace_match = re.search(r"\{[\s\S]*\}", stripped)
+    if brace_match:
+        candidates.append(brace_match.group(0).strip())
+
+    for raw in candidates:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def run_codex_exec_prompt(
+    *,
+    prompt: str,
+    workdir: Path,
+    timeout_sec: int,
+    codex_bin: str,
+    model: str | None,
+) -> tuple[int, str, str, bool]:
+    fd, output_path_raw = tempfile.mkstemp(prefix="shogun-codex-", suffix=".txt")
+    os.close(fd)
+    output_path = Path(output_path_raw)
+    cmd = [
+        codex_bin,
+        "exec",
+        "--full-auto",
+        "--sandbox",
+        "workspace-write",
+        "--skip-git-repo-check",
+        "--cd",
+        str(workdir),
+        "--output-last-message",
+        str(output_path),
+        prompt,
+    ]
+    if model:
+        cmd[2:2] = ["--model", model]
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=max(10, timeout_sec),
+            check=False,
+        )
+        stdout = result.stdout or ""
+        stderr = result.stderr or ""
+        last_message = ""
+        if output_path.exists():
+            last_message = output_path.read_text(encoding="utf-8", errors="replace")
+        return result.returncode, last_message.strip(), (stdout + "\n" + stderr).strip(), False
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout if isinstance(exc.stdout, str) else (exc.stdout.decode("utf-8", "ignore") if exc.stdout else "")
+        stderr = exc.stderr if isinstance(exc.stderr, str) else (exc.stderr.decode("utf-8", "ignore") if exc.stderr else "")
+        return 124, "", (stdout + "\n" + stderr).strip(), True
+    finally:
+        output_path.unlink(missing_ok=True)
+
+
+def run_karo_llm_decomposition(
+    *,
+    parent: dict[str, object],
+    max_subtasks: int,
+    workdir: Path,
+    timeout_sec: int,
+    codex_bin: str,
+    model: str | None,
+) -> list[dict[str, str | None]]:
+    description = str(parent.get("description") or "")
+    subject = str(parent.get("subject") or "")
+    prompt = (
+        "あなたは将軍システムの家老。以下の任務を、独立して並列実行しやすい単位へ分解せよ。"
+        "日本語で考えてよいが、出力は必ずJSONのみ。\n"
+        f"最大分割数: {max_subtasks if max_subtasks > 0 else 10}\n"
+        "形式:\n"
+        "{\n"
+        '  "subtasks":[\n'
+        '    {"label":"短い名前","command":"実行可能なコマンド(無ければ空文字)","notes":"狙い"},\n'
+        "  ]\n"
+        "}\n"
+        "制約:\n"
+        "- 依存が強い作業は1サブタスクにまとめる\n"
+        "- 独立作業は分ける\n"
+        "- 危険な削除コマンドを提案しない\n"
+        "- commandを作れない場合は空文字でよい\n"
+        f"\nParentSubject:\n{subject}\n\nParentDescription:\n{description}\n"
+    )
+    code, answer, stderr, timed_out = run_codex_exec_prompt(
+        prompt=prompt,
+        workdir=workdir,
+        timeout_sec=timeout_sec,
+        codex_bin=codex_bin,
+        model=model,
+    )
+    if timed_out or code != 0 or not answer:
+        return []
+
+    payload = try_parse_json_payload(answer)
+    if not payload:
+        return []
+    raw_subtasks = payload.get("subtasks")
+    if not isinstance(raw_subtasks, list):
+        return []
+
+    specs: list[dict[str, str | None]] = []
+    for idx, item in enumerate(raw_subtasks, start=1):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "").strip() or f"分解任務 {idx}"
+        command = str(item.get("command") or "").strip() or None
+        notes = str(item.get("notes") or "").strip() or None
+        specs.append(
+            {
+                "label": label,
+                "command": command,
+                "source": "llm_decompose",
+                "notes": notes,
+            }
+        )
+    if max_subtasks > 0:
+        return specs[:max_subtasks]
+    return specs
+
+
+def should_use_codex_for_task(command: str | None, subject: str, description: str, mode: str) -> bool:
+    normalized_mode = mode.lower()
+    if normalized_mode == "shell":
+        return False
+    if normalized_mode == "codex":
+        return True
+    if not command:
+        return True
+    simple = command.strip()
+    if re.fullmatch(r"(echo|printf|pwd|date|ls)(\s+.*)?", simple):
+        return False
+    text = f"{subject}\n{description}\n{command}".lower()
+    return bool(
+        re.search(
+            r"(implement|fix|refactor|design|spec|readme|doc|test|build|deploy|調査|実装|設計|修正|検証|最適化|追加)",
+            text,
+        )
+    )
+
+
+def run_ashigaru_autonomous_task(
+    *,
+    task: dict[str, object],
+    command: str | None,
+    workdir: Path,
+    timeout_sec: int,
+    codex_bin: str,
+    model: str | None,
+) -> tuple[bool, str, str]:
+    task_id = int(task["id"])
+    subject = str(task.get("subject") or "")
+    description = str(task.get("description") or "")
+    prompt = (
+        "あなたは将軍システムの足軽。以下の任務を達成せよ。\n"
+        f"TaskId: {task_id}\n"
+        f"Subject: {subject}\n"
+        "Description:\n"
+        f"{description}\n\n"
+        "指針:\n"
+        "- 必要に応じてファイル編集・テスト・ビルドを行う\n"
+        "- 作業が終わったら、最後の回答で簡潔に以下JSONを返す\n"
+        '{ "result": "done|blocked|failed", "summary": "...", "notes": "..." }\n'
+    )
+    if command:
+        prompt += f"\n参考コマンド:\n{command}\n"
+
+    code, answer, stderr, timed_out = run_codex_exec_prompt(
+        prompt=prompt,
+        workdir=workdir,
+        timeout_sec=timeout_sec,
+        codex_bin=codex_bin,
+        model=model,
+    )
+    if timed_out:
+        return False, "", "codex timeout"
+    if code != 0:
+        return False, answer, stderr or f"codex exited with {code}"
+    if not answer:
+        return False, "", "codex returned empty response"
+    payload = try_parse_json_payload(answer)
+    if payload:
+        result = str(payload.get("result") or "done").lower()
+        summary = str(payload.get("summary") or "").strip()
+        notes = str(payload.get("notes") or "").strip()
+        merged = "\n".join(part for part in [summary, notes] if part).strip() or answer
+        if result in {"blocked", "fail", "failed"}:
+            return False, merged, f"codex result={result}"
+        return True, merged, ""
+    return True, answer, ""
+
+
+def role_display_name(name: str) -> str:
+    normalized = (name or "").strip()
+    if normalized == "shogun":
+        return "将軍"
+    if normalized == "karo":
+        return "家老"
+    if normalized == "metsuke":
+        return "目付"
+    if normalized.startswith("ashigaru"):
+        return normalized
+    return normalized or "使者"
+
+
+def fixed_honorific_title(name: str) -> str | None:
+    normalized = (name or "").strip()
+    mapping = {
+        "shogun": "将軍殿",
+        "karo": "家老殿",
+        "metsuke": "目付殿",
+    }
+    return mapping.get(normalized)
+
+
+def enforce_fixed_honorific_header(*, recipient: str, text: str) -> str:
+    rendered = text or ""
+    fixed = fixed_honorific_title(recipient)
+    if not fixed:
+        return rendered
+    lines = rendered.splitlines()
+    if not lines:
+        return rendered
+    head = lines[0].lstrip()
+    if not head:
+        return rendered
+    head = re.sub(r"^(上様|将軍殿|将軍|家老殿|家老|目付殿|目付)\s*[、,]\s*", f"{fixed}、", head, count=1)
+    if not re.match(rf"^{re.escape(fixed)}[、,]", head):
+        head = f"{fixed}、{head}"
+    lines[0] = head
+    return "\n".join(lines)
+
+
+def split_log_tail(content: str) -> tuple[str, str]:
+    for marker in ("\n実行ログ:\n", "\nexecution log:\n", "\nExecutionLog:\n"):
+        idx = content.find(marker)
+        if idx >= 0:
+            head = content[:idx].rstrip()
+            tail = content[idx:].rstrip()
+            return head, tail
+    return content.rstrip(), ""
+
+
+def load_honorific_guard_entries() -> list[dict[str, object]]:
+    global HONORIFIC_GUARD_ENTRIES_CACHE
+    if HONORIFIC_GUARD_ENTRIES_CACHE is not None:
+        return HONORIFIC_GUARD_ENTRIES_CACHE
+
+    dictionary_path = root_dir() / HONORIFIC_MISUSE_DICTIONARY_RELATIVE_PATH
+    try:
+        payload = json.loads(dictionary_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+
+    entries = payload.get("entries")
+    if isinstance(entries, list):
+        normalized = [entry for entry in entries if isinstance(entry, dict)]
+        if normalized:
+            HONORIFIC_GUARD_ENTRIES_CACHE = normalized
+            return normalized
+
+    HONORIFIC_GUARD_ENTRIES_CACHE = list(DEFAULT_HONORIFIC_GUARD_ENTRIES)
+    return HONORIFIC_GUARD_ENTRIES_CACHE
+
+
+def honorific_guard_entry_applies(
+    entry: dict[str, object],
+    *,
+    sender: str,
+    recipient: str,
+) -> bool:
+    applies = entry.get("applies_when")
+    if not isinstance(applies, dict):
+        return True
+    sender_rule = applies.get("sender")
+    recipient_rule = applies.get("recipient")
+    if isinstance(sender_rule, str) and sender_rule and not fnmatch.fnmatchcase(sender, sender_rule):
+        return False
+    if isinstance(recipient_rule, str) and recipient_rule and not fnmatch.fnmatchcase(recipient, recipient_rule):
+        return False
+    return True
+
+
+def detect_honorific_guard_violations(
+    *,
+    sender: str,
+    recipient: str,
+    content: str,
+) -> list[dict[str, str]]:
+    body, _tail = split_log_tail(content or "")
+    target_text = body or (content or "")
+    if not target_text.strip():
+        return []
+
+    violations: list[dict[str, str]] = []
+    for entry in load_honorific_guard_entries():
+        if not honorific_guard_entry_applies(entry, sender=sender, recipient=recipient):
+            continue
+        raw_patterns = entry.get("detect_regex")
+        if isinstance(raw_patterns, str):
+            patterns = [raw_patterns]
+        elif isinstance(raw_patterns, list):
+            patterns = [value for value in raw_patterns if isinstance(value, str)]
+        else:
+            patterns = []
+        if not patterns:
+            continue
+
+        matched = False
+        for pattern in patterns:
+            try:
+                if re.search(pattern, target_text, flags=re.MULTILINE):
+                    matched = True
+                    break
+            except re.error:
+                continue
+        if not matched:
+            continue
+
+        violations.append(
+            {
+                "id": str(entry.get("id") or "unknown"),
+                "category": str(entry.get("category") or "呼称違反"),
+                "expected": str(entry.get("expected") or ""),
+            }
+        )
+    return violations
+
+
+def latest_outbound_report_message(
+    db: Path,
+    *,
+    task_id: int,
+    sender: str,
+) -> tuple[int, str, str] | None:
+    with connect(db) as conn:
+        row = conn.execute(
+            """
+            SELECT id, recipient, content
+            FROM messages
+            WHERE task_id = ? AND sender = ? AND recipient IN ('karo', 'shogun')
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (task_id, sender),
+        ).fetchone()
+    if row is None:
+        return None
+    return int(row["id"]), str(row["recipient"] or ""), str(row["content"] or "")
+
+
+def honorific_rework_reason(db: Path, task: dict[str, object]) -> str | None:
+    task_id_raw = task.get("id")
+    if task_id_raw is None:
+        return None
+    try:
+        task_id = int(task_id_raw)
+    except (TypeError, ValueError):
+        return None
+    sender = str(task.get("owner") or "")
+    if not sender:
+        return None
+    report = latest_outbound_report_message(db, task_id=task_id, sender=sender)
+    if report is None:
+        return None
+    message_id, recipient, content = report
+    violations = detect_honorific_guard_violations(sender=sender, recipient=recipient, content=content)
+    if not violations:
+        return None
+    rule_tokens = [f"{item['id']}({item['category']})" for item in violations[:3]]
+    expected = next((item["expected"] for item in violations if item.get("expected")), "")
+    suffix = f" / 期待例: {short(expected, 48)}" if expected else ""
+    return (
+        f"呼称ガード違反を検知（msg#{message_id}, {recipient}宛）: "
+        + ", ".join(rule_tokens)
+        + suffix
+    )
+
+
+def message_task_id(msg: dict[str, object]) -> int | None:
+    value = msg.get("task_id")
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str) and value.strip().isdigit():
+        return int(value.strip())
+    return None
+
+
+def summarize_intent_from_command(command: str | None) -> str:
+    if not command:
+        return "要件を確認し、必要な作業を段取りして進める"
+    first_line = command.strip().splitlines()[0].strip()
+    lowered = first_line.lower()
+    if lowered.startswith(("pytest", "pnpm test", "npm test", "cargo test", "go test")):
+        return "まず試験を回し、失敗点を洗い出して修正へ繋げる"
+    if lowered.startswith(("pnpm run build", "npm run build", "cargo build", "go build", "make")):
+        return "先に組み立てを行い、成立しない箇所を潰して仕上げる"
+    if lowered.startswith(("git", "gh")):
+        return "差分と履歴を確認し、必要な更新のみ慎重に進める"
+    return f"まず `{short(first_line, 52)}` を起点に作業し、結果を順次上申する"
+
+
+def karo_reply_to_field_reports(
+    args: argparse.Namespace,
+    messages: list[dict[str, object]],
+    max_replies: int = 0,
+) -> tuple[int, int]:
+    handled = 0
+    deferred = 0
+    for msg in messages:
+        sender = str(msg.get("sender") or "")
+        if not sender.startswith("ashigaru"):
+            continue
+        task_id = message_task_id(msg)
+        if task_id is None:
+            continue
+        if max_replies > 0 and handled >= max_replies:
+            deferred += 1
+            continue
+        content = str(msg.get("content") or "")
+        lowered = content.lower()
+        if any(token in lowered for token in ("失敗", "時限超過", "blocked", "停止", "阻塞")):
+            reply = (
+                f"{sender}、報せは受領した。任務 #{task_id} は阻塞扱いにて将軍殿へ上申する。"
+                "原因を一点ずつ切り分け、再挑戦案を整えて待て。"
+            )
+        elif any(token in lowered for token in ("検分", "仕上げ", "完了", "review")):
+            reply = (
+                f"{sender}、任務 #{task_id} の仕上げ報告を受領。"
+                "目付へ検分下知を回した。追加照会が来るまでは次の下知に備えよ。"
+            )
+        elif any(token in lowered for token in ("中間", "進捗", "作戦", "着手", "これより")):
+            reply = (
+                f"{sender}、任務 #{task_id} の進捗は把握した。"
+                "作戦方針を是認する。危険を感じた時のみ即時上申し、"
+                "それ以外は前進して戦果を刻め。"
+            )
+        else:
+            reply = (
+                f"{sender}、任務 #{task_id} の報せを受領。"
+                "要点を維持しつつ実行を続け、節目で再度上申せよ。"
+            )
+        shogun_comm_send(
+            args.db,
+            args.mode,
+            args.name,
+            sender,
+            reply,
+            task_id=task_id,
+            summary=f"ack {task_id}",
+        )
+        handled += 1
+        narrate("家老", f"{sender} の戦況報告へ応答（任務 #{task_id}）。")
+
+    if deferred > 0:
+        narrate(
+            "家老",
+            f"戦況応答は {handled} 件実施、残り {deferred} 件は次巡へ回付。",
+        )
+    return handled, deferred
+
+
+def ashigaru_has_karo_ack(task_id: int, messages: list[dict[str, object]]) -> bool:
+    for msg in messages:
+        sender = str(msg.get("sender") or "")
+        if sender != "karo":
+            continue
+        if message_task_id(msg) == task_id:
+            return True
+    return False
+
+
+def naturalize_line(line: str) -> str:
+    text = line.strip()
+    if not text:
+        return ""
+    replacements = {
+        "下知:": "下知として、",
+        "親任務:": "本件の出自は、",
+        "分担:": "分担は、",
+        "作戦意図:": "作戦意図は、",
+        "役回り:": "役回りは、",
+        "軍律:": "軍律として、",
+        "戦果:": "戦果として、",
+        "検分記録:": "検分記録として、",
+        "完了後は": "仕上がり次第、",
+    }
+    for src, dst in replacements.items():
+        if text.startswith(src):
+            text = text.replace(src, dst, 1)
+            break
+    return text
+
+
+def samuraiize_line(text: str, tone: str) -> str:
+    line = (text or "").strip()
+    if not line:
+        return ""
+    normalized = tone if tone in SAMURAI_TONES else "strong"
+    replacements_common = (
+        ("ご報告します", "上申いたす"),
+        ("報告します", "上申いたす"),
+        ("お願いします", "願い奉る"),
+        ("してください", "されよ"),
+        ("しました", "つかまつった"),
+        ("します", "いたす"),
+        ("ました", "つかまつった"),
+        ("です", "でござる"),
+    )
+    replacements_strong = (
+        ("完了しました", "成就つかまつった"),
+        ("確認しました", "検分つかまつった"),
+        ("実行してください", "遂行されよ"),
+        ("確認してください", "検分されよ"),
+    )
+    for src, dst in replacements_common:
+        line = line.replace(src, dst)
+    if normalized == "strong":
+        for src, dst in replacements_strong:
+            line = line.replace(src, dst)
+
+    if normalized == "strong":
+        if line.endswith("です。"):
+            line = line[:-3] + "にござる。"
+        elif line.endswith("ます。"):
+            line = line[:-3] + "候。"
+        elif line.endswith("ました。"):
+            line = line[:-4] + "つかまつった。"
+        elif line.endswith("。") and not re.search(r"(ござる|候|つかまつった|いたす|下知|上申|検分)$", line[:-1]):
+            line = line[:-1] + "候。"
+    return line
+
+
+def samuraiize_text(text: str, tone: str) -> str:
+    lines = text.splitlines()
+    rendered: list[str] = []
+    for raw in lines:
+        if not raw.strip():
+            rendered.append(raw)
+            continue
+        if raw.lstrip().startswith("`"):
+            rendered.append(raw)
+            continue
+        prefix = raw[: len(raw) - len(raw.lstrip())]
+        converted = samuraiize_line(raw.strip(), tone)
+        rendered.append(f"{prefix}{converted}")
+    return "\n".join(rendered)
+
+
+def fallback_dialogue_rewrite(
+    *,
+    sender: str,
+    recipient: str,
+    content: str,
+    task_id: int | None,
+    summary: str | None,
+) -> str:
+    lines = [naturalize_line(line) for line in content.splitlines() if line.strip()]
+    if not lines:
+        return content
+    sender_name = role_display_name(sender)
+    recipient_title = fixed_honorific_title(recipient)
+    if recipient_title:
+        opener = f"{recipient_title}、{sender_name}より進捗を上申つかまつる。"
+    else:
+        recipient_name = role_display_name(recipient)
+        seed = f"{sender}:{recipient}:{task_id or 0}:{summary or ''}:{content[:64]}"
+        openers = (
+            f"{recipient_name}殿へ。{sender_name}より申し上げ候。",
+            f"{sender_name}より{recipient_name}殿へ、戦況を上申つかまつる。",
+            f"{recipient_name}殿、{sender_name}からの早馬にござる。",
+        )
+        opener = openers[stable_index(seed, len(openers))]
+    rendered = [opener]
+    for line in lines[:8]:
+        rendered.append(f"・{samuraiize_line(line, RUNTIME_SAMURAI_TONE)}")
+    if len(lines) > 8:
+        rendered.append(f"・ほか {len(lines) - 8} 件の補足あり候。")
+    return "\n".join(rendered)
+
+
+def run_dialogue_llm_rewrite(
+    *,
+    sender: str,
+    recipient: str,
+    content: str,
+    task_id: int | None,
+    summary: str | None,
+) -> str | None:
+    if not RUNTIME_DIALOGUE_CODEX_BIN or not RUNTIME_DIALOGUE_WORKDIR:
+        return None
+    recipient_title = fixed_honorific_title(recipient)
+    honorific_rule = ""
+    if recipient_title:
+        honorific_rule = f"宛名の先頭は必ず「{recipient_title}、」で固定すること。\n"
+    prompt = (
+        "次の業務連絡を、戦国武家の軍議で交わす自然な日本語の短文メッセージへ言い換えよ。"
+        "事実・依頼・タスク番号は保持し、創作しないこと。"
+        "『下知』『上申』『検分』『候』『ござる』などを適宜使い、過度にふざけず実務的に。"
+        "箇条書きでもよいが自然な文章で、出力は本文のみ。\n"
+        f"送信者: {role_display_name(sender)} ({sender})\n"
+        f"宛先: {role_display_name(recipient)} ({recipient})\n"
+        f"task_id: {task_id if task_id is not None else 'none'}\n"
+        f"summary: {summary or ''}\n"
+        f"{honorific_rule}"
+        "原文:\n"
+        f"{content}\n"
+    )
+    code, answer, _stderr, timed_out = run_codex_exec_prompt(
+        prompt=prompt,
+        workdir=RUNTIME_DIALOGUE_WORKDIR,
+        timeout_sec=RUNTIME_DIALOGUE_TIMEOUT_SEC,
+        codex_bin=RUNTIME_DIALOGUE_CODEX_BIN,
+        model=RUNTIME_DIALOGUE_CODEX_MODEL,
+    )
+    if timed_out or code != 0:
+        return None
+    cleaned = (answer or "").strip()
+    if not cleaned:
+        return None
+    fenced = re.findall(r"```(?:text)?\s*(.*?)```", cleaned, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        cleaned = fenced[0].strip()
+    payload = try_parse_json_payload(cleaned)
+    if payload and isinstance(payload.get("message"), str):
+        cleaned = str(payload["message"]).strip()
+    if not cleaned:
+        return None
+    return samuraiize_text(cleaned, RUNTIME_SAMURAI_TONE)
+
+
+def rewrite_dialogue_content(
+    *,
+    sender: str,
+    recipient: str,
+    content: str,
+    task_id: int | None,
+    summary: str | None,
+) -> str:
+    mode = (RUNTIME_DIALOGUE_MODE or "template").lower()
+    if mode == "template":
+        return normalize_honorific_targets(sender=sender, recipient=recipient, text=content)
+    head, tail = split_log_tail(content)
+    if not head:
+        return normalize_honorific_targets(sender=sender, recipient=recipient, text=content)
+
+    rewritten: str | None = None
+    if mode in {"llm", "auto"} and len(head) <= 1800:
+        rewritten = run_dialogue_llm_rewrite(
+            sender=sender,
+            recipient=recipient,
+            content=head,
+            task_id=task_id,
+            summary=summary,
+        )
+    if not rewritten:
+        rewritten = fallback_dialogue_rewrite(
+            sender=sender,
+            recipient=recipient,
+            content=head,
+            task_id=task_id,
+            summary=summary,
+        )
+    rewritten = samuraiize_text(rewritten, RUNTIME_SAMURAI_TONE)
+    rewritten = normalize_honorific_targets(sender=sender, recipient=recipient, text=rewritten)
+    if tail:
+        return f"{rewritten}\n{tail}"
+    return rewritten
+
+
+def normalize_honorific_targets(*, sender: str, recipient: str, text: str) -> str:
+    rendered = enforce_fixed_honorific_header(recipient=recipient, text=text)
+    if recipient == "shogun":
+        # 将軍宛メッセージで「上様」を混在させると指揮系統が曖昧になるため固定化する。
+        rendered = rendered.replace("上様", "将軍殿")
+        rendered = re.sub(r"(?m)^将軍[、,]", "将軍殿、", rendered)
+    return rendered
 
 
 def format_process_output(stdout: str, stderr: str, max_chars: int) -> str:
@@ -432,15 +1439,28 @@ def make_child_description(
     command: str | None,
     *,
     drama: bool,
-    persona: str,
+    persona: str | None,
+    subtask_label: str | None = None,
+    decomposition_source: str | None = None,
+    subtask_notes: str | None = None,
 ) -> str:
     lines = [
         f"ParentTask: {parent['id']}",
         f"ParentSubject: {str(parent['subject'])}",
-        "",
-        "Mission:",
-        (str(parent.get("description") or "") or str(parent["subject"])).strip(),
     ]
+    if subtask_label:
+        lines.append(f"SubtaskLabel: {subtask_label}")
+    if decomposition_source and decomposition_source != "single":
+        lines.append(f"Decomposition: {decomposition_source}")
+    if subtask_notes:
+        lines.append(f"SubtaskNotes: {subtask_notes}")
+    lines.extend(
+        [
+            "",
+            "Mission:",
+            (str(parent.get("description") or "") or str(parent["subject"])).strip(),
+        ]
+    )
     if command:
         lines.extend(["", "command:", command])
     lines.extend(
@@ -455,12 +1475,19 @@ def make_child_description(
         lines.extend(
             [
                 "",
-                "役回り:",
-                f"- この任務では「{persona}」として遂行せよ。",
-                "- 軍律: 自分の任務のみ実行すること。",
+                "軍律:",
+                "- 自分の任務のみ実行すること。",
                 "- 越権は『切腹』（比喩: 即再任務）とする。",
             ]
         )
+        if persona:
+            lines.extend(
+                [
+                    "",
+                    "役回り:",
+                    f"- この任務では「{persona}」として遂行せよ。",
+                ]
+            )
     return "\n".join(lines)
 
 
@@ -477,50 +1504,155 @@ def cycle_karo(args: argparse.Namespace) -> str:
     label = "家老"
     messages = shogun_comm_read(args.db, args.mode, args.name, args.inbox_limit)
     announce_inbox(label, messages)
+    recover_orphan_worker_tasks(args)
+
+    karo_mode = args.karo_decompose_mode.lower()
+    karo_codex_bin: str | None = None
+    if karo_mode in {"llm", "auto"}:
+        karo_codex_bin = detect_codex_binary(args.karo_codex_bin)
+        if not karo_codex_bin and not getattr(args, "_karo_codex_warned", False):
+            narrate(
+                label,
+                (
+                    f"分解モード={karo_mode} だが codex 実行基盤を検出できず。"
+                    "規定の分割規則へ退避。"
+                ),
+            )
+            setattr(args, "_karo_codex_warned", True)
 
     parents_todo = select_tasks(args.db, owner=args.name, statuses=("todo",))
     for parent in parents_todo:
-        chosen = choose_worker(args.db)
-        if not chosen:
-            narrate(label, f"任務 #{parent['id']} は配下不在につき保留。")
+        parent_id = int(parent["id"])
+        specs = build_subtask_specs(parent, args.karo_max_subtasks)
+        if karo_mode in {"llm", "auto"} and karo_codex_bin:
+            llm_specs = run_karo_llm_decomposition(
+                parent=parent,
+                max_subtasks=args.karo_max_subtasks,
+                workdir=args.workdir,
+                timeout_sec=args.karo_codex_timeout_sec,
+                codex_bin=karo_codex_bin,
+                model=args.karo_codex_model or None,
+            )
+            if llm_specs:
+                specs = llm_specs
+                narrate(label, f"任務 #{parent_id} を自律分解（{len(specs)}件）。")
+            else:
+                narrate(label, f"任務 #{parent_id} は自律分解に失敗。規定分割へ退避。")
+
+        if not specs:
+            narrate(label, f"任務 #{parent_id} は分解不能につき保留。")
             continue
-        command = extract_command(str(parent.get("description") or ""))
-        child_subject = f"[親#{parent['id']}] {str(parent['subject'])}"
-        persona = choose_persona(str(parent.get("subject") or ""), str(parent.get("description") or ""))
-        child_desc = make_child_description(parent, command, drama=args.drama, persona=persona)
-        child_id = task_create(
-            args.db,
-            actor=args.name,
-            owner=chosen,
-            reporter=str(parent.get("reporter") or args.name),
-            subject=child_subject,
-            description=child_desc,
-            priority=int(parent.get("priority") or 2),
-            parent_id=int(parent["id"]),
-        )
-        task_update(args.db, int(parent["id"]), args.name, status="in_progress")
-        rally = war_phrase("karo_assign", f"{parent['id']}:{chosen}:{child_id}")
-        worker_msg_lines = [
-            f"下知: 任務 #{child_id} を遂行せよ。",
-            f"親任務: #{parent['id']} {parent['subject']}",
-            "仕上げたら status=review とし、家老へ報告せよ。",
-        ]
-        if args.drama:
-            worker_msg_lines.insert(2, f"役回り: {persona}")
-            worker_msg_lines.insert(3, "軍律: 自分の任務のみ実行せよ（越権は切腹=再任務）。")
-        if args.drama and rally:
-            worker_msg_lines.append(f"檄: {rally}")
-        worker_msg = "\n".join(worker_msg_lines)
-        shogun_msg_lines = [f"上様へ報告。任務 #{parent['id']}「{parent['subject']}」を {chosen} へ割り当て候（子任務 #{child_id}）。"]
-        if args.drama:
-            shogun_msg_lines.append(f"采配: {chosen} の役回りは「{persona}」。")
-        if args.drama and rally:
-            shogun_msg_lines.append(f"軍議メモ: {rally}")
-        shogun_msg = "\n".join(shogun_msg_lines)
-        shogun_comm_send(args.db, args.mode, args.name, chosen, worker_msg, task_id=child_id, summary=f"task {child_id}")
-        shogun_comm_send(args.db, args.mode, args.name, "shogun", shogun_msg, task_id=int(parent["id"]), summary=f"delegated {parent['id']}")
-        extra = f" {rally}" if (args.drama and rally) else ""
-        narrate(label, f"任務 #{parent['id']} を {chosen} へ下知（子任務 #{child_id}）。{extra}".strip())
+
+        task_update(args.db, parent_id, args.name, status="in_progress")
+        assignments: list[tuple[int, str, str, str | None, str | None]] = []
+        total = len(specs)
+
+        for idx, spec in enumerate(specs, start=1):
+            chosen = choose_worker(args.db)
+            if not chosen:
+                narrate(label, f"任務 #{parent_id} 子{idx}/{total} は配下不在につき保留。")
+                continue
+            label_hint = str(spec.get("label") or "").strip()
+            command = str(spec.get("command") or "").strip() or None
+            decomposition_source = str(spec.get("source") or "single")
+            subtask_notes = str(spec.get("notes") or "").strip() or None
+            command, sanitize_note = sanitize_subtask_command(command)
+            if sanitize_note:
+                if subtask_notes:
+                    subtask_notes = f"{subtask_notes} / {sanitize_note}"
+                else:
+                    subtask_notes = sanitize_note
+
+            if total > 1:
+                child_subject = f"[親#{parent_id}/子{idx}/{total}] {label_hint or parent['subject']}"
+            else:
+                child_subject = f"[親#{parent_id}] {str(parent['subject'])}"
+
+            persona = choose_persona(label_hint or str(parent.get("subject") or ""), command or str(parent.get("description") or ""))
+            child_desc = make_child_description(
+                parent,
+                command,
+                drama=args.drama,
+                persona=persona,
+                subtask_label=label_hint or None,
+                decomposition_source=decomposition_source,
+                subtask_notes=subtask_notes,
+            )
+            child_id = task_create(
+                args.db,
+                actor=args.name,
+                owner=chosen,
+                reporter=str(parent.get("reporter") or args.name),
+                subject=child_subject,
+                description=child_desc,
+                priority=int(parent.get("priority") or 2),
+                parent_id=parent_id,
+            )
+
+            rally = war_phrase("karo_assign", f"{parent_id}:{chosen}:{child_id}")
+            worker_msg_lines = [
+                f"下知: 任務 #{child_id} を遂行せよ。",
+                f"親任務: #{parent_id} {parent['subject']}",
+                "仕上げたら status=review とし、家老へ報告せよ。",
+            ]
+            if total > 1:
+                worker_msg_lines.append(f"分担: 子{idx}/{total} {label_hint or '分割任務'}")
+            if subtask_notes:
+                worker_msg_lines.append(f"作戦意図: {subtask_notes}")
+            if args.drama:
+                if persona:
+                    worker_msg_lines.append(f"役回り: {persona}")
+                worker_msg_lines.append("軍律: 自分の任務のみ実行せよ（越権は切腹=再任務）。")
+            if args.drama and rally:
+                worker_msg_lines.append(f"檄: {rally}")
+            worker_msg = "\n".join(worker_msg_lines)
+            shogun_comm_send(args.db, args.mode, args.name, chosen, worker_msg, task_id=child_id, summary=f"task {child_id}")
+            assignments.append((child_id, chosen, label_hint, persona, subtask_notes))
+            extra = f" {rally}" if (args.drama and rally) else ""
+            narrate(
+                label,
+                f"任務 #{parent_id} 子{idx}/{total} を {chosen} へ下知（子任務 #{child_id}）。{extra}".strip(),
+            )
+
+        if assignments:
+            shogun_msg_lines = [
+                f"将軍殿へ報告。任務 #{parent_id}「{parent['subject']}」を {len(assignments)} 分隊へ割り当て候。"
+            ]
+            for child_id, chosen, label_hint, persona, subtask_notes in assignments:
+                details: list[str] = []
+                if label_hint:
+                    details.append(label_hint)
+                if args.drama and persona:
+                    details.append(persona)
+                if subtask_notes:
+                    details.append(short(subtask_notes, 56))
+                if details:
+                    shogun_msg_lines.append(f"- 子任務 #{child_id}: {chosen}（{' / '.join(details)}）")
+                else:
+                    shogun_msg_lines.append(f"- 子任務 #{child_id}: {chosen}")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "shogun",
+                "\n".join(shogun_msg_lines),
+                task_id=parent_id,
+                summary=f"delegated {parent_id} x{len(assignments)}",
+            )
+        else:
+            task_update(args.db, parent_id, args.name, status="blocked")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "shogun",
+                f"将軍殿、任務 #{parent_id}「{parent['subject']}」は配下不在にて阻塞。増援の下知を乞う。",
+                task_id=parent_id,
+                summary=f"blocked {parent_id}",
+            )
+
+    # Prioritize fresh shogun directives before consuming large field-report backlogs.
+    karo_reply_to_field_reports(args, messages, max_replies=args.karo_max_ack_per_cycle)
 
     parents_active = select_tasks(args.db, owner=args.name, statuses=("in_progress", "blocked"))
     for parent in parents_active:
@@ -539,7 +1671,7 @@ def cycle_karo(args: argparse.Namespace) -> str:
                     args.name,
                     "shogun",
                     (
-                        f"上様、任務 #{parent_id}「{parent['subject']}」は全子任務完了につき成就いたしました。"
+                        f"将軍殿、任務 #{parent_id}「{parent['subject']}」は全子任務完了につき成就いたしました。"
                         + (f"\n戦況: {finish_line}" if (args.drama and finish_line) else "")
                     ),
                     task_id=parent_id,
@@ -555,7 +1687,7 @@ def cycle_karo(args: argparse.Namespace) -> str:
                     args.mode,
                     args.name,
                     "shogun",
-                    f"上様、任務 #{parent_id}「{parent['subject']}」は阻塞あり。指示を乞う。",
+                    f"将軍殿、任務 #{parent_id}「{parent['subject']}」は阻塞あり。指示を乞う。",
                     task_id=parent_id,
                     summary=f"blocked {parent_id}",
                 )
@@ -576,16 +1708,57 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
     label = args.name
     messages = shogun_comm_read(args.db, args.mode, args.name, args.inbox_limit)
     announce_inbox(label, messages)
+    acknowledged_task_ids = {
+        task_id
+        for msg in messages
+        if str(msg.get("sender") or "") == "karo"
+        for task_id in [message_task_id(msg)]
+        if task_id is not None
+    }
+
+    exec_mode = args.ashigaru_exec_mode.lower()
+    ashigaru_codex_bin: str | None = None
+    if exec_mode in {"codex", "auto"}:
+        ashigaru_codex_bin = detect_codex_binary(args.ashigaru_codex_bin)
+        if not ashigaru_codex_bin and not getattr(args, "_ashigaru_codex_warned", False):
+            narrate(
+                label,
+                (
+                    f"実行モード={exec_mode} だが codex 実行基盤を検出できず。"
+                    "command実行へ退避。"
+                ),
+            )
+            setattr(args, "_ashigaru_codex_warned", True)
 
     tasks = select_tasks(args.db, owner=args.name, statuses=("todo", "in_progress", "blocked"))
-    blocked = any(str(task["status"]) == "blocked" for task in tasks)
     todo_or_progress = [task for task in tasks if str(task["status"]) in {"todo", "in_progress"}]
 
     for task in todo_or_progress:
         task_id = int(task["id"])
+        now_ts = time.time()
+        flow = ASHIGARU_FLOW_STATE.setdefault(
+            task_id,
+            {
+                "awaiting_ack": False,
+                "started_at": now_ts,
+                "last_progress_at": 0.0,
+                "execution_announced": False,
+                "progress_count": 0,
+            },
+        )
+        if task_id in acknowledged_task_ids:
+            flow["awaiting_ack"] = False
+
         if str(task["status"]) == "todo":
             task_update(args.db, task_id, args.name, status="in_progress")
             start_phrase = war_phrase("ashigaru_start", f"{args.name}:{task_id}")
+            command = extract_command(str(task.get("description") or ""))
+            intent = summarize_intent_from_command(command)
+            flow["awaiting_ack"] = True
+            flow["started_at"] = now_ts
+            flow["last_progress_at"] = now_ts
+            flow["execution_announced"] = False
+            flow["progress_count"] = 0
             shogun_comm_send(
                 args.db,
                 args.mode,
@@ -593,15 +1766,120 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                 "karo",
                 (
                     f"家老殿、任務 #{task_id}「{task['subject']}」へ着手つかまつる。"
+                    + f"\n作戦案: {intent}"
+                    + "\n裁可を賜りしだい本実行へ移る。"
                     + (f"\n檄応答: {start_phrase}" if (args.drama and start_phrase) else "")
                 ),
                 task_id=task_id,
                 summary=f"start {task_id}",
             )
             narrate(label, f"任務 #{task_id} に着手。{start_phrase if (args.drama and start_phrase) else ''}".strip())
+            continue
 
         command = extract_command(str(task.get("description") or ""))
-        if command:
+        subject = str(task.get("subject") or "")
+        description = str(task.get("description") or "")
+        use_codex = False
+        if ashigaru_codex_bin and exec_mode in {"codex", "auto"}:
+            use_codex = should_use_codex_for_task(command, subject, description, exec_mode)
+
+        if bool(flow.get("awaiting_ack", False)):
+            elapsed = now_ts - float(flow.get("started_at") or now_ts)
+            if elapsed < float(args.ashigaru_ack_wait_sec):
+                last_progress_at = float(flow.get("last_progress_at") or 0.0)
+                if now_ts - last_progress_at >= float(args.ashigaru_progress_interval_sec):
+                    shogun_comm_send(
+                        args.db,
+                        args.mode,
+                        args.name,
+                        "karo",
+                        (
+                            f"家老殿、任務 #{task_id} は裁可待ちに候。"
+                            "方針を維持しつつ待機中、下知あれば即応いたす。"
+                        ),
+                        task_id=task_id,
+                        summary=f"progress {task_id}",
+                    )
+                    flow["last_progress_at"] = now_ts
+                    flow["progress_count"] = int(flow.get("progress_count") or 0) + 1
+                narrate(label, f"任務 #{task_id} は家老裁可を待機中。")
+                continue
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "karo",
+                f"家老殿、任務 #{task_id} は裁可待ち時限に達した。独断にて実行へ移る。",
+                task_id=task_id,
+                summary=f"progress {task_id}",
+            )
+            flow["awaiting_ack"] = False
+
+        if not bool(flow.get("execution_announced", False)):
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "karo",
+                f"家老殿、任務 #{task_id} はこれより実働段へ移る。中間報告は継続する。",
+                task_id=task_id,
+                summary=f"progress {task_id}",
+            )
+            flow["execution_announced"] = True
+            flow["last_progress_at"] = now_ts
+
+        if use_codex:
+            narrate(label, f"任務 #{task_id} を自律実行(codex)へ移行。")
+            ok, result_text, reason = run_ashigaru_autonomous_task(
+                task=task,
+                command=command,
+                workdir=args.workdir,
+                timeout_sec=args.ashigaru_codex_timeout_sec,
+                codex_bin=ashigaru_codex_bin,
+                model=args.ashigaru_codex_model or None,
+            )
+            execution_log = truncate_chars((result_text or "(no output)").strip(), args.output_max_chars)
+            if not ok:
+                task_update(args.db, task_id, args.name, status="blocked")
+                shogun_comm_send(
+                    args.db,
+                    args.mode,
+                    args.name,
+                    "karo",
+                    (
+                        f"家老殿、任務 #{task_id} の自律実行に失敗。"
+                        + (f"\n申し開き: {reason}" if reason else "")
+                        + ("\n軍律上、追加下知を願う。" if args.drama else "")
+                        + f"\n実行ログ:\n{execution_log}"
+                    ),
+                    task_id=task_id,
+                    summary=f"failed {task_id}",
+                )
+                narrate(label, f"任務 #{task_id} は自律実行失敗。")
+                ASHIGARU_FLOW_STATE.pop(task_id, None)
+                continue
+
+            task_update(args.db, task_id, args.name, status="review")
+            done_phrase = war_phrase("ashigaru_done", f"{args.name}:{task_id}")
+            ok_message = (
+                f"家老殿、任務 #{task_id} 仕上げ候。目付殿の検分を願う。\n"
+                + "実行形態: codex-autonomous\n"
+                + (f"戦果: {done_phrase}\n" if (args.drama and done_phrase) else "")
+                + f"実行ログ:\n{execution_log}"
+            )
+            shogun_comm_send(args.db, args.mode, args.name, "karo", ok_message, task_id=task_id, summary=f"ready {task_id}")
+            shogun_comm_send(
+                args.db,
+                args.mode,
+                args.name,
+                "metsuke",
+                f"目付殿、任務 #{task_id} の検分を願う。",
+                task_id=task_id,
+                summary=f"review {task_id}",
+            )
+            narrate(label, f"任務 #{task_id} を検分待ちへ送致。{done_phrase if (args.drama and done_phrase) else ''}".strip())
+            ASHIGARU_FLOW_STATE.pop(task_id, None)
+        elif command:
             narrate(label, f"任務 #{task_id} 実行: {short(command, 80)}")
             code, out, err, timed_out = run_shell(command, args.workdir, args.max_command_sec)
             execution_log = format_process_output(out, err, args.output_max_chars)
@@ -621,6 +1899,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     summary=f"timeout {task_id}",
                 )
                 narrate(label, f"任務 #{task_id} は時限超過。")
+                ASHIGARU_FLOW_STATE.pop(task_id, None)
                 continue
             if code != 0:
                 task_update(args.db, task_id, args.name, status="blocked")
@@ -638,6 +1917,7 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                     summary=f"failed {task_id}",
                 )
                 narrate(label, f"任務 #{task_id} は失敗（exit={code}）。")
+                ASHIGARU_FLOW_STATE.pop(task_id, None)
                 continue
             task_update(args.db, task_id, args.name, status="review")
             done_phrase = war_phrase("ashigaru_done", f"{args.name}:{task_id}")
@@ -657,29 +1937,29 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
                 summary=f"review {task_id}",
             )
             narrate(label, f"任務 #{task_id} を検分待ちへ送致。{done_phrase if (args.drama and done_phrase) else ''}".strip())
+            ASHIGARU_FLOW_STATE.pop(task_id, None)
         else:
-            task_update(args.db, task_id, args.name, status="review")
+            task_update(args.db, task_id, args.name, status="blocked")
             shogun_comm_send(
                 args.db,
                 args.mode,
                 args.name,
                 "karo",
-                f"家老殿、任務 #{task_id} は手順整理を完了。検分を願う。",
+                (
+                    f"家老殿、任務 #{task_id} は実行命令が見当たらず停止。"
+                    + ("\n自律実行(codex)も利用不能につき追加下知を願う。" if not ashigaru_codex_bin else "")
+                ),
                 task_id=task_id,
-                summary=f"ready {task_id}",
+                summary=f"blocked {task_id}",
             )
-            shogun_comm_send(
-                args.db,
-                args.mode,
-                args.name,
-                "metsuke",
-                f"目付殿、任務 #{task_id} を検分願う。",
-                task_id=task_id,
-                summary=f"review {task_id}",
-            )
-            narrate(label, f"任務 #{task_id} は実行命令なし。検分待ちへ。")
+            narrate(label, f"任務 #{task_id} は実行命令なしで停止。")
+            ASHIGARU_FLOW_STATE.pop(task_id, None)
 
     remaining = select_tasks(args.db, owner=args.name, statuses=("todo", "in_progress", "blocked"))
+    active_ids = {int(task["id"]) for task in remaining}
+    for stale_task_id in list(ASHIGARU_FLOW_STATE.keys()):
+        if stale_task_id not in active_ids:
+            ASHIGARU_FLOW_STATE.pop(stale_task_id, None)
     if any(str(task["status"]) == "blocked" for task in remaining):
         return "blocked"
     if any(str(task["status"]) in {"todo", "in_progress"} for task in remaining):
@@ -687,9 +1967,14 @@ def cycle_ashigaru(args: argparse.Namespace) -> str:
     return "idle"
 
 
-def needs_rework(task: dict[str, object]) -> bool:
+def needs_rework(db: Path, task: dict[str, object]) -> tuple[bool, str]:
     merged = f"{task.get('subject', '')}\n{task.get('description', '')}"
-    return bool(re.search(r"(REWORK|要再作業|\bNG\b)", merged, re.IGNORECASE))
+    if bool(re.search(r"(REWORK|要再作業|\bNG\b)", merged, re.IGNORECASE)):
+        return True, "要再作業マーカーを検出"
+    honorific_reason = honorific_rework_reason(db, task)
+    if honorific_reason:
+        return True, honorific_reason
+    return False, ""
 
 
 def cycle_metsuke(args: argparse.Namespace) -> str:
@@ -698,11 +1983,64 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
     announce_inbox(label, messages)
 
     review_tasks = select_tasks(args.db, owner_like="ashigaru%", statuses=("review",))
+    parent_ids = {
+        int(task["parent_id"])
+        for task in review_tasks
+        if task.get("parent_id") is not None
+    }
+    parent_state: dict[int, tuple[str, str]] = {}
+    if parent_ids:
+        placeholders = ",".join("?" for _ in sorted(parent_ids))
+        with connect(args.db) as conn:
+            rows = conn.execute(
+                f"SELECT id, status, owner FROM tasks WHERE id IN ({placeholders})",
+                tuple(sorted(parent_ids)),
+            ).fetchall()
+        for row in rows:
+            parent_state[int(row["id"])] = (
+                str(row["status"] or ""),
+                str(row["owner"] or ""),
+            )
+
+    def review_priority_bucket(task: dict[str, object]) -> int:
+        pid_raw = task.get("parent_id")
+        parent_bucket = 1
+        if pid_raw is not None:
+            parent_snapshot = parent_state.get(int(pid_raw))
+            if parent_snapshot:
+                p_status, p_owner = parent_snapshot
+                if p_owner == "karo" and p_status in {"in_progress", "blocked"}:
+                    # 親任務の完了待ちを解消するため優先検分
+                    parent_bucket = 0
+        return parent_bucket
+
+    # 家老配下で未完了の親任務にぶら下がるレビューを優先し、
+    # その中でも親任務IDが新しいもの（直近の将軍依頼）を先に処理する。
+    review_tasks = sorted(
+        review_tasks,
+        key=lambda task: str(task.get("updated_at") or ""),
+        reverse=True,
+    )
+    review_tasks = sorted(
+        review_tasks,
+        key=lambda task: int(task.get("parent_id") or 0),
+        reverse=True,
+    )
+    review_tasks = sorted(review_tasks, key=review_priority_bucket)
+    max_reviews = max(0, int(getattr(args, "metsuke_max_reviews_per_cycle", 0) or 0))
+    processed = 0
+    deferred = 0
+
     for task in review_tasks:
+        if max_reviews > 0 and processed >= max_reviews:
+            deferred += 1
+            continue
         task_id = int(task["id"])
         owner = str(task.get("owner") or "")
-        if needs_rework(task):
+        needs_fix, rework_reason = needs_rework(args.db, task)
+        if needs_fix:
             rework_line = war_phrase("metsuke_rework", f"{task_id}:{owner}")
+            reason_line = f"\n差戻し理由: {rework_reason}" if rework_reason else ""
             task_update(args.db, task_id, args.name, status="in_progress")
             shogun_comm_send(
                 args.db,
@@ -711,6 +2049,7 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
                 owner,
                 (
                     f"{owner}、任務 #{task_id} は差戻し。要件を見直して再提出せよ。"
+                    + reason_line
                     + (f"\n軍律: {rework_line}" if (args.drama and rework_line) else "")
                 ),
                 task_id=task_id,
@@ -723,12 +2062,14 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
                 "karo",
                 (
                     f"家老殿、任務 #{task_id} は差戻しとした。"
+                    + reason_line
                     + (f"\n検分記録: {rework_line}" if (args.drama and rework_line) else "")
                 ),
                 task_id=task_id,
                 summary=f"rework {task_id}",
             )
             narrate(label, f"任務 #{task_id} を差戻し。{rework_line if (args.drama and rework_line) else ''}".strip())
+            processed += 1
             continue
         pass_line = war_phrase("metsuke_pass", f"{task_id}:{owner}")
         task_update(args.db, task_id, args.name, status="done")
@@ -758,6 +2099,10 @@ def cycle_metsuke(args: argparse.Namespace) -> str:
                 summary=f"passed {task_id}",
             )
         narrate(label, f"任務 #{task_id} を合格。{pass_line if (args.drama and pass_line) else ''}".strip())
+        processed += 1
+
+    if deferred > 0:
+        narrate(label, f"検分は {processed} 件実施、残り {deferred} 件は次巡へ回付。")
 
     remaining = select_tasks(args.db, owner_like="ashigaru%", statuses=("review",))
     return "reviewing" if remaining else "idle"
@@ -783,6 +2128,108 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inbox-limit", type=int, default=100)
     parser.add_argument("--max-command-sec", type=int, default=180)
     parser.add_argument(
+        "--ashigaru-ack-wait-sec",
+        type=float,
+        default=env_float("SHOGUN_ASHIGARU_ACK_WAIT_SEC", 8.0),
+        help="How long ashigaru waits for karo acknowledgement before proceeding",
+    )
+    parser.add_argument(
+        "--ashigaru-progress-interval-sec",
+        type=float,
+        default=env_float("SHOGUN_ASHIGARU_PROGRESS_INTERVAL_SEC", 10.0),
+        help="Interval for interim progress reports while waiting/running",
+    )
+    parser.add_argument(
+        "--dialogue-mode",
+        choices=DIALOGUE_MODES,
+        default=env_str("SHOGUN_DIALOGUE_MODE", "auto"),
+        help="Outbound message style: template/llm/auto",
+    )
+    parser.add_argument(
+        "--dialogue-codex-bin",
+        default=env_str("SHOGUN_DIALOGUE_CODEX_BIN", "codex"),
+        help="Codex executable used for natural-language rewrite",
+    )
+    parser.add_argument(
+        "--dialogue-codex-model",
+        default=os.getenv("SHOGUN_DIALOGUE_CODEX_MODEL"),
+        help="Optional model for dialogue rewrite",
+    )
+    parser.add_argument(
+        "--dialogue-codex-timeout-sec",
+        type=int,
+        default=env_int("SHOGUN_DIALOGUE_CODEX_TIMEOUT_SEC", 20),
+        help="Timeout for dialogue rewrite",
+    )
+    parser.add_argument(
+        "--samurai-tone",
+        choices=SAMURAI_TONES,
+        default=env_str("SHOGUN_SAMURAI_TONE", "strong"),
+        help="Samurai speech intensity for agent dialogue: light/strong",
+    )
+    parser.add_argument(
+        "--karo-decompose-mode",
+        choices=KARO_DECOMPOSE_MODES,
+        default=env_str("SHOGUN_KARO_DECOMPOSE_MODE", "auto"),
+        help="Task decomposition strategy for karo: rule/llm/auto",
+    )
+    parser.add_argument(
+        "--karo-codex-bin",
+        default=env_str("SHOGUN_KARO_CODEX_BIN", "codex"),
+        help="Codex executable used by karo when llm decomposition is enabled",
+    )
+    parser.add_argument(
+        "--karo-codex-model",
+        default=os.getenv("SHOGUN_KARO_CODEX_MODEL"),
+        help="Optional model passed to codex exec for karo decomposition",
+    )
+    parser.add_argument(
+        "--karo-codex-timeout-sec",
+        type=int,
+        default=env_int("SHOGUN_KARO_CODEX_TIMEOUT_SEC", 70),
+        help="Timeout for karo codex decomposition",
+    )
+    parser.add_argument(
+        "--ashigaru-exec-mode",
+        choices=ASHIGARU_EXEC_MODES,
+        default=env_str("SHOGUN_ASHIGARU_EXEC_MODE", "auto"),
+        help="Execution strategy for ashigaru: shell/codex/auto",
+    )
+    parser.add_argument(
+        "--ashigaru-codex-bin",
+        default=env_str("SHOGUN_ASHIGARU_CODEX_BIN", "codex"),
+        help="Codex executable used by ashigaru in autonomous mode",
+    )
+    parser.add_argument(
+        "--ashigaru-codex-model",
+        default=os.getenv("SHOGUN_ASHIGARU_CODEX_MODEL"),
+        help="Optional model passed to codex exec for ashigaru",
+    )
+    parser.add_argument(
+        "--ashigaru-codex-timeout-sec",
+        type=int,
+        default=env_int("SHOGUN_ASHIGARU_CODEX_TIMEOUT_SEC", 900),
+        help="Timeout for ashigaru codex autonomous execution",
+    )
+    parser.add_argument(
+        "--karo-max-subtasks",
+        type=int,
+        default=int(os.getenv("SHOGUN_KARO_MAX_SUBTASKS", "10")),
+        help="Maximum number of child tasks generated from one parent task (0 = unlimited).",
+    )
+    parser.add_argument(
+        "--karo-max-ack-per-cycle",
+        type=int,
+        default=int(os.getenv("SHOGUN_KARO_MAX_ACK_PER_CYCLE", "12")),
+        help="Maximum ashigaru field-report replies sent by karo per cycle (0 = unlimited).",
+    )
+    parser.add_argument(
+        "--metsuke-max-reviews-per-cycle",
+        type=int,
+        default=int(os.getenv("SHOGUN_METSUKE_MAX_REVIEWS_PER_CYCLE", "8")),
+        help="Maximum review tasks processed by metsuke per cycle (0 = unlimited).",
+    )
+    parser.add_argument(
         "--output-max-chars",
         type=int,
         default=int(os.getenv("SHOGUN_AGENT_OUTPUT_MAX_CHARS", "4000")),
@@ -797,9 +2244,31 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def configure_dialogue_runtime(args: argparse.Namespace) -> None:
+    global RUNTIME_DIALOGUE_MODE
+    global RUNTIME_DIALOGUE_CODEX_BIN
+    global RUNTIME_DIALOGUE_CODEX_MODEL
+    global RUNTIME_DIALOGUE_TIMEOUT_SEC
+    global RUNTIME_DIALOGUE_WORKDIR
+    global RUNTIME_SAMURAI_TONE
+
+    mode = (args.dialogue_mode or "template").lower()
+    RUNTIME_DIALOGUE_MODE = mode
+    RUNTIME_DIALOGUE_CODEX_MODEL = args.dialogue_codex_model or None
+    RUNTIME_DIALOGUE_TIMEOUT_SEC = max(8, int(args.dialogue_codex_timeout_sec))
+    RUNTIME_DIALOGUE_WORKDIR = args.workdir
+    RUNTIME_SAMURAI_TONE = args.samurai_tone if args.samurai_tone in SAMURAI_TONES else "strong"
+
+    if mode in {"llm", "auto"}:
+        RUNTIME_DIALOGUE_CODEX_BIN = detect_codex_binary(args.dialogue_codex_bin)
+    else:
+        RUNTIME_DIALOGUE_CODEX_BIN = None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    configure_dialogue_runtime(args)
     status_cache: str | None = None
     if args.drama:
         opening = {
@@ -814,6 +2283,13 @@ def main(argv: list[str] | None = None) -> int:
             "ashigaru": f"{args.name}、出陣。下知を待つ。",
         }[args.role]
     narrate(args.name, opening)
+    if args.dialogue_mode in {"llm", "auto"}:
+        if RUNTIME_DIALOGUE_CODEX_BIN:
+            narrate(args.name, f"文通様式: {args.dialogue_mode}（自然言語リライト有効 / 口調={RUNTIME_SAMURAI_TONE}）")
+        else:
+            narrate(args.name, f"文通様式: {args.dialogue_mode}（規則変換のみで運用 / 口調={RUNTIME_SAMURAI_TONE}）")
+    else:
+        narrate(args.name, f"文通様式: template（定型文 / 口調={RUNTIME_SAMURAI_TONE}）")
 
     while True:
         desired = status_cache or "idle"

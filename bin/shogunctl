@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -146,6 +147,13 @@ def is_ashigaru(name: str | None) -> bool:
     return bool(name) and name.startswith("ashigaru")
 
 
+def env_enabled(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def enforce_policy(actor: str, action: str, target: str | None = None) -> None:
     if actor != "shogun":
         return
@@ -258,6 +266,12 @@ def cmd_member_set_status(args: argparse.Namespace) -> int:
 
 def cmd_task_create(args: argparse.Namespace) -> int:
     actor = args.actor
+    if args.parent_id is None and actor != "shogun" and not env_enabled("SHOGUN_ALLOW_NON_SHOGUN_ROOT_TASKS", default=False):
+        print(
+            "DENY: root task must be created by shogun. Use bin/shogun-remote run \"...\" or actor=shogun.",
+            file=sys.stderr,
+        )
+        return 2
     if args.owner:
         try:
             enforce_policy(actor, "assign_task", target=args.owner)
@@ -679,7 +693,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_init.set_defaults(func=cmd_init)
 
     p_seed = sub.add_parser("seed-team", help="Seed default team members")
-    p_seed.add_argument("--ashigaru", type=int, default=10, help="Number of ashigaru workers")
+    p_seed.add_argument("--ashigaru", type=int, default=7, help="Number of ashigaru workers")
     p_seed.add_argument("--reset", action="store_true", help="Delete existing members before seeding")
     p_seed.set_defaults(func=cmd_seed_team)
 
